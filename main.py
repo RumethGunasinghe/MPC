@@ -11,7 +11,7 @@ USE_MPC = True   # Toggle here
 dt = 0.01
 
 # SETUP
-env = CartPole(theta=0.2)
+env = CartPole(theta=0.5)
 
 if USE_MPC:
     controller = MPCController()
@@ -28,7 +28,7 @@ time_list = []
 
 # PLOT SETUP (ANIMATION)
 fig, ax = plt.subplots()
-ax.set_xlim(-3, 3)
+ax.set_xlim(-5,5)
 ax.set_ylim(-1.5, 1.5)
 
 cart_w, cart_h = 0.4, 0.2
@@ -43,6 +43,18 @@ def update(frame):
     global theta_list, x_list, force_list, time_list
 
     x, x_dot, theta, theta_dot = env.get_state()
+
+    if frame == 200:
+        if x_dot > 0:
+            env.theta -= 0.5  # push
+        else:
+            env.theta += 0.2
+
+    # if frame == 400:
+    #     if x_dot > 0:
+    #         env.theta -= 0.2   # push
+    #     else:
+    #         env.theta += 0.2
 
     # Compute control
     force = controller.compute(x, x_dot, theta, theta_dot)
