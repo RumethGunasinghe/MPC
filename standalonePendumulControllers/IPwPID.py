@@ -18,7 +18,7 @@ MAX_FORCE = 20
 
 # State
 x, x_dot = 0.0, 0.0
-theta, theta_dot = 0.2, 0.0
+theta, theta_dot = -0.2, 0.0
 
 # Plot
 fig, ax = plt.subplots()
@@ -66,14 +66,10 @@ def update(frame):
 
     # Draw
     cart.set_xy((x - cart_w/2, -0.1))
-
     px = x + l * np.sin(theta)
     py = l * np.cos(theta)
-
     pole.set_data([x, px], [0, py])
-
     text.set_text(f"x={x:.2f}, theta={theta:.2f}")
-
     return pole, cart, text
 
 # Run
