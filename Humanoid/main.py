@@ -1,21 +1,21 @@
 from Environments.HumanoidEnv import HumanoidEnv
 from controllers.pid import PIDHumanoid
-import pybullet as p
-
+# from controllers.mpc import MPCHumanoid   # switch later
 
 env = HumanoidEnv()
 
-for i in range(env.num_joints):
-    print(i, p.getJointInfo(env.robot, i)[1])
-
-    
+# 🔥 start with PID
 controller = PIDHumanoid()
 
 while True:
-    pos, vel, torso_angle = env.get_state()
+    # get torso state
+    angle, velocity = env.get_state()
 
-    torque = 200 * torso_angle + 40 * vel[0]
+    # compute control
+    torque = controller.compute(angle, velocity)
 
-    env.apply_torque(env.hip_joints, [torque, torque])
+    # apply to BOTH hips + ankles
+    env.apply_torque(env.hip_joints, [torque * 0.3, torque * 0.3])
+    env.apply_torque(env.ankle_joints, [torque, torque])
 
     env.step()
