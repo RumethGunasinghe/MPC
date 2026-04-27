@@ -4,16 +4,18 @@ class PIDHumanoid:
     def __init__(self):
         self.Kp_angle = 80
         self.Kd_angle = 20
+        self.Kp_vel = 25
+        self.Kp_com = 120   # 🔥 NEW powerful term
 
-        self.Kp_pos = 30      # 🔥 NEW (COM control)
-        self.max_torque = 60
+        self.max_torque = 80
 
-    def compute(self, angle, angular_vel, linear_vel):
+    def compute(self, angle, ang_vel, lin_vel, com_error):
 
         torque = (
             self.Kp_angle * angle +
-            self.Kd_angle * angular_vel +
-            self.Kp_pos * linear_vel   # 🔥 THIS IS THE BIG UPGRADE
+            self.Kd_angle * ang_vel +
+            self.Kp_vel * lin_vel +
+            self.Kp_com * com_error
         )
 
         return np.clip(torque, -self.max_torque, self.max_torque)

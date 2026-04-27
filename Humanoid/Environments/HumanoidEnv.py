@@ -45,11 +45,15 @@ class HumanoidEnv:
         self.ankle_joints = [11, 14]
 
         # initial pose (VERY IMPORTANT)
-        p.resetJointState(self.robot, 10, 0.2)
-        p.resetJointState(self.robot, 13, 0.2)
-
+        #knees
+        # p.resetJointState(self.robot, 10, -0.1)
+        # p.resetJointState(self.robot, 13, -0.1)
+        #ankles
         p.resetJointState(self.robot, 11, -0.1)
         p.resetJointState(self.robot, 14, -0.1)
+        #hips
+        p.resetJointState(self.robot, 9, -5)
+        p.resetJointState(self.robot, 12, -5)
 
         self.dt = 1/240
 
@@ -61,9 +65,17 @@ class HumanoidEnv:
         base_vel, base_ang_vel = p.getBaseVelocity(self.robot)
 
         angular_vel = base_ang_vel[1]
-        linear_vel = base_vel[0]   # 🔥 forward/back motion
+        linear_vel = base_vel[0]
 
-        return angle, angular_vel, linear_vel
+        # feet positions
+        right_foot = p.getLinkState(self.robot, 11)[0]
+        left_foot  = p.getLinkState(self.robot, 14)[0]
+
+        foot_center = (right_foot[0] + left_foot[0]) / 2
+
+        com_error = base_pos[0] - foot_center
+
+        return angle, angular_vel, linear_vel, com_error
 
     def apply_torque(self, joints, torques):
         for i, joint in enumerate(joints):
