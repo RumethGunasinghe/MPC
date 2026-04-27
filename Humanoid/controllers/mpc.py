@@ -2,25 +2,37 @@ import numpy as np
 
 class MPCHumanoid:
     def __init__(self):
-        self.torque_candidates = np.linspace(-100, 100, 15)
-        self.horizon = 5
+        self.torque_candidates = np.linspace(-80, 80, 15)
+        self.horizon = 8
         self.dt = 0.01
 
-    def compute(self, angle, velocity):
+    def compute(self, angle, angular_vel, linear_vel):
+
         best_torque = 0
         best_cost = float("inf")
 
         for torque in self.torque_candidates:
 
             temp_angle = angle
-            temp_vel = velocity
+            temp_ang_vel = angular_vel
+            temp_lin_vel = linear_vel
+
             cost = 0
 
             for _ in range(self.horizon):
-                temp_vel += torque * self.dt
-                temp_angle += temp_vel * self.dt
 
-                cost += temp_angle**2 + 0.1 * temp_vel**2
+                # 🔥 improved prediction
+                temp_ang_vel += torque * self.dt
+                temp_angle += temp_ang_vel * self.dt
+
+                temp_lin_vel += torque * 0.5 * self.dt
+
+                # 🔥 COST FUNCTION (VERY IMPORTANT)
+                cost += (
+                    100 * temp_angle**2 +
+                    10 * temp_ang_vel**2 +
+                    5 * temp_lin_vel**2
+                )
 
             if cost < best_cost:
                 best_cost = cost

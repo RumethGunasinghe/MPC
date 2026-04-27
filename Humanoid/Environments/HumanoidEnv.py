@@ -56,12 +56,14 @@ class HumanoidEnv:
     # CORRECT state (torso, not joints)
     def get_state(self):
         base_pos, base_orn = p.getBasePositionAndOrientation(self.robot)
-        torso_angle = p.getEulerFromQuaternion(base_orn)[1]
+        angle = p.getEulerFromQuaternion(base_orn)[1]
 
         base_vel, base_ang_vel = p.getBaseVelocity(self.robot)
-        torso_velocity = base_ang_vel[1]
 
-        return torso_angle, torso_velocity
+        angular_vel = base_ang_vel[1]
+        linear_vel = base_vel[0]   # 🔥 forward/back motion
+
+        return angle, angular_vel, linear_vel
 
     def apply_torque(self, joints, torques):
         for i, joint in enumerate(joints):
@@ -75,7 +77,7 @@ class HumanoidEnv:
     def step(self):
         p.stepSimulation()
 
-        # 🔥 damping (stability fix)
+        # damping (stability fix)
         base_vel, base_ang_vel = p.getBaseVelocity(self.robot)
 
         p.resetBaseVelocity(
@@ -84,12 +86,12 @@ class HumanoidEnv:
             angularVelocity=[v * 0.98 for v in base_ang_vel]
         )
 
-        p.applyExternalForce(
-            self.robot,
-            -1,
-            forceObj=[0, 0, -5],
-            posObj=[0, 0, 0],
-            flags=p.WORLD_FRAME
-        )
+        # p.applyExternalForce(
+        #     self.robot,
+        #     -1,
+        #     forceObj=[0, 0, -5],
+        #     posObj=[0, 0, 0],
+        #     flags=p.WORLD_FRAME
+        # )
 
         time.sleep(self.dt)

@@ -1,14 +1,19 @@
 import numpy as np
 
 class PIDHumanoid:
-    def __init__(self, Kp=60, Kd=15, max_torque=40):
-        self.Kp = Kp
-        self.Kd = Kd
-        self.max_torque = max_torque
+    def __init__(self):
+        self.Kp_angle = 80
+        self.Kd_angle = 20
 
-    def compute(self, angle, velocity):
-        if abs(angle) < 0.02:
-            return 0   # 🔥 ignore small noise
+        self.Kp_pos = 30      # 🔥 NEW (COM control)
+        self.max_torque = 60
 
-        torque = self.Kp * (angle + 0.02) + self.Kd * velocity
+    def compute(self, angle, angular_vel, linear_vel):
+
+        torque = (
+            self.Kp_angle * angle +
+            self.Kd_angle * angular_vel +
+            self.Kp_pos * linear_vel   # 🔥 THIS IS THE BIG UPGRADE
+        )
+
         return np.clip(torque, -self.max_torque, self.max_torque)

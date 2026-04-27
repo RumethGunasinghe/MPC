@@ -4,19 +4,16 @@ from controllers.pid import PIDHumanoid
 
 env = HumanoidEnv()
 
-# 🔥 start with PID
+#  start with PID
 controller = PIDHumanoid()
 
 while True:
-    # get torso state
-    angle, velocity = env.get_state()
+    angle, ang_vel, lin_vel = env.get_state()
 
-    # compute control
-    torque = controller.compute(angle, velocity)
+    torque = controller.compute(angle, ang_vel, lin_vel)
 
-    # apply to BOTH hips + ankles
-    env.apply_torque(env.hip_joints, [torque * 0.4, torque * 0.4])
-    env.apply_torque(env.knee_joints, [-torque * 0.3, -torque * 0.3])  # 🔥 NEW
-    env.apply_torque(env.ankle_joints, [torque, torque])
-
+    # improved distribution
+    env.apply_torque(env.ankle_joints, [torque, torque])            # primary balance
+    env.apply_torque(env.knee_joints, [-torque * 0.5, -torque * 0.5])  # support
+    env.apply_torque(env.hip_joints, [torque * 0.7, torque * 0.7])      # recovery
     env.step()
