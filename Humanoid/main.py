@@ -15,7 +15,8 @@ while True:
     torque = controller.compute(angle, velocity)
 
     # apply to BOTH hips + ankles
-    env.apply_torque(env.hip_joints, [torque * 0.3, torque * 0.3])
+    env.apply_torque(env.hip_joints, [torque * 0.4, torque * 0.4])
+    env.apply_torque(env.knee_joints, [-torque * 0.3, -torque * 0.3])  # 🔥 NEW
     env.apply_torque(env.ankle_joints, [torque, torque])
 
     env.step()

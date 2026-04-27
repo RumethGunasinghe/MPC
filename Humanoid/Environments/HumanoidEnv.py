@@ -39,12 +39,12 @@ class HumanoidEnv:
                 force=0
             )
 
-        # ✅ correct joints (from your output)
+        # correct joints (from  output)
         self.hip_joints = [9, 12]
         self.knee_joints = [10, 13]
         self.ankle_joints = [11, 14]
 
-        # 🔥 initial pose (VERY IMPORTANT)
+        # initial pose (VERY IMPORTANT)
         p.resetJointState(self.robot, 10, 0.2)
         p.resetJointState(self.robot, 13, 0.2)
 
@@ -53,7 +53,7 @@ class HumanoidEnv:
 
         self.dt = 1/240
 
-    # ✅ CORRECT state (torso, not joints)
+    # CORRECT state (torso, not joints)
     def get_state(self):
         base_pos, base_orn = p.getBasePositionAndOrientation(self.robot)
         torso_angle = p.getEulerFromQuaternion(base_orn)[1]
