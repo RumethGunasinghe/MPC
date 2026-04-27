@@ -3,11 +3,11 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 from InversePendulum import CartPole
-from PID import PIDController
-from MPC import MPCController
+from Controllers.PID import PIDController
+from Controllers.MPC import MPCController
 
 # SETTINGS
-USE_MPC = True   # Toggle here
+USE_MPC = False   # Toggle here
 dt = 0.01
 
 # SETUP
@@ -44,6 +44,8 @@ def update(frame):
 
     x, x_dot, theta, theta_dot = env.get_state()
 
+
+#Disturbance
     if frame == 200:
         if x_dot > 0:
             env.theta -= 0.5  # push
@@ -95,7 +97,7 @@ plt.figure(figsize=(10, 6))
 plt.subplot(3, 1, 1)
 plt.plot(time_list, theta_list)
 plt.ylabel("Theta (rad)")
-plt.title(f"{title} - System Response")
+plt.title(f"{title} - System Response with disturbance at t=2s")
 
 # Position
 plt.subplot(3, 1, 2)
