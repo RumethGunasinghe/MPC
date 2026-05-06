@@ -7,7 +7,7 @@ from Controllers.PID import PIDController
 from Controllers.MPC import MPCController
 
 # SETTINGS
-USE_MPC = False   # Toggle here
+USE_MPC = True   # Toggle here
 dt = 0.01
 
 # SETUP

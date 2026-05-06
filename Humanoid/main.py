@@ -1,55 +1,123 @@
-from Environments.HumanoidEnv import HumanoidEnv
-from controllers.pid import PIDHumanoid
-from controllers.mpc import MPCHumanoid
-import matplotlib.pyplot as plt
-import pybullet as p
-from utils.logger import GraphLogger
+import mujoco
+import mujoco.viewer
+import numpy as np
 
-# from controllers.mpc import MPCHumanoid   # switch later
+# =========================================
+# LOAD MODEL
+# =========================================
 
-env = HumanoidEnv()
-logger = GraphLogger()
+model = mujoco.MjModel.from_xml_path(
+    "h1Model/mjcf/scene.xml"
+)
 
-#  start with PID
-controller = MPC()
+data = mujoco.MjData(model)
 
+# =========================================
+# ACTUATOR IDS
+# =========================================
 
+LEFT_HIP = 2
+LEFT_KNEE = 3
+LEFT_ANKLE = 4
 
-#For printing data
+RIGHT_HIP = 7
+RIGHT_KNEE = 8
+RIGHT_ANKLE = 9
 
-time_data = []
+# =========================================
+# CONTROL GAINS
+# =========================================
 
-hip_angle = []
-hip_vel = []
-hip_torque = []
+KP_POSTURE = 80
+KD_POSTURE = 8
 
-knee_angle = []
-knee_vel = []
-knee_torque = []
+KP_BALANCE = 120
+KD_BALANCE = 70
 
-ankle_angle = []
-ankle_vel = []
-ankle_torque = []
+# =========================================
+# STANDING POSTURE
+# =========================================
 
+targets = {
 
+    # slight forward lean
+    LEFT_HIP: -0.10,
+    RIGHT_HIP: -0.10,
 
-for step in range(2000):
+    # slight knee bend
+    LEFT_KNEE: 0.25,
+    RIGHT_KNEE: 0.25,
 
-    angle, ang_vel, lin_vel, com_error = env.get_state()
+    # ankle compensation
+    LEFT_ANKLE: 0.15,
+    RIGHT_ANKLE: 0.15,
+}
 
-    torque = controller.compute(angle, ang_vel, lin_vel, com_error)
+# =========================================
+# MAIN LOOP
+# =========================================
 
-    env.apply_torque(env.ankle_joints, [torque, torque])
-    env.apply_torque(env.knee_joints, [-torque * 0.5, -torque * 0.5])
-    env.apply_torque(env.hip_joints, [torque * 0.7, torque * 0.7])
+with mujoco.viewer.launch_passive(model, data) as viewer:
 
-    # read right side joints
-    hip = p.getJointState(env.robot, 9)
-    knee = p.getJointState(env.robot, 10)
-    ankle = p.getJointState(env.robot, 11)
+    while viewer.is_running():
 
-    logger.log(step * env.dt, hip, knee, ankle, torque)
+        q = data.qpos
+        qd = data.qvel
 
-    env.step()
+        # =====================================
+        # RESET CONTROLS
+        # =====================================
 
-logger.plot()
+        data.ctrl[:] = 0
+
+        # =====================================
+        # TORSO BALANCE
+        # =====================================
+
+        quat = q[3:7]
+
+        torso_pitch = quat[1]
+        torso_pitch_vel = qd[4]
+
+        balance_torque = (
+            -KP_BALANCE * torso_pitch
+            -KD_BALANCE * torso_pitch_vel
+        )
+
+        # =====================================
+        # POSTURE CONTROL
+        # =====================================
+
+        for actuator_id, target in targets.items():
+
+            pos = q[actuator_id + 7]
+            vel = qd[actuator_id + 6]
+
+            torque = (
+                -KP_POSTURE * (pos - target)
+                -KD_POSTURE * vel
+            )
+
+            data.ctrl[actuator_id] = torque
+
+        # =====================================
+        # ANKLE STRATEGY
+        # =====================================
+
+        data.ctrl[LEFT_ANKLE] += 0.4 * balance_torque
+        data.ctrl[RIGHT_ANKLE] += 0.4 * balance_torque
+
+        # =====================================
+        # HIP STRATEGY
+        # =====================================
+
+        data.ctrl[LEFT_HIP] -= 0.2 * balance_torque
+        data.ctrl[RIGHT_HIP] -= 0.2 * balance_torque
+
+        # =====================================
+        # STEP SIMULATION
+        # =====================================
+
+        mujoco.mj_step(model, data)
+
+        viewer.sync()
