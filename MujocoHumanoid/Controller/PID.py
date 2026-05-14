@@ -8,17 +8,17 @@ print("PID FILE LOADED")
 
 # BALANCE GAINS
 
-Kp_balance = 35
-Kd_balance = 40
+Kp_balance = 25
+Kd_balance = 55
 
 # JOINT GAINS
 
-Kp_joint = 200
-Kd_joint = 45
+Kp_joint = 220
+Kd_joint = 60
 
-# H1 NOMINAL STANDING POSE
+# H1 CROUCHED STANCE
 
-DESIRED_HIP = 0.18
+DESIRED_HIP = 0.28
 DESIRED_KNEE = -0.79
 DESIRED_ANKLE = 0.52
 
@@ -26,11 +26,13 @@ DESIRED_ANKLE = 0.52
 
 mpc = MPCController()
 
-# QUATERNION → APPROX ORIENTATION
+# TORSO ORIENTATION
 
 def get_torso_angles(data):
 
     quat = data.qpos[3:7]
+
+    # approximate orientation
 
     roll = quat[0]
     pitch = quat[1]
@@ -63,20 +65,26 @@ def compute_control(data, joints):
 
     ctrl = {}
 
-    # TORSO ORIENTATION
+    # =====================================
+    # BODY ORIENTATION
+    # =====================================
 
     roll, pitch = get_torso_angles(data)
 
     torso_pitch_vel = qd[4]
 
+    # =====================================
     # COM ESTIMATION
+    # =====================================
 
     com = compute_com(data)
 
     com_x = com["x"]
     com_vx = com["vx"]
 
+    # =====================================
     # MPC BALANCE
+    # =====================================
 
     mpc_balance = mpc.compute_balance(
 
@@ -84,16 +92,20 @@ def compute_control(data, joints):
         torso_pitch_vel
     )
 
+    # =====================================
     # COM BALANCE
+    # =====================================
 
     balance_pitch = (
 
-        -40 * com_x
-        -10 * com_vx
-        + 0.15 * mpc_balance
+        -55 * com_x
+        -20 * com_vx
+        + 0.05 * mpc_balance
     )
 
+    # =====================================
     # HIP CONTROL
+    # =====================================
 
     for joint in [
 
@@ -117,10 +129,12 @@ def compute_control(data, joints):
                 Kd_joint
             )
 
-            - 0.05 * balance_pitch
+            - 0.03 * balance_pitch
         )
 
+    # =====================================
     # KNEE CONTROL
+    # =====================================
 
     for joint in [
 
@@ -144,10 +158,12 @@ def compute_control(data, joints):
                 Kd_joint
             )
 
-            + + 140
+            + 140
         )
 
+    # =====================================
     # ANKLE CONTROL
+    # =====================================
 
     for joint in [
 
@@ -162,8 +178,8 @@ def compute_control(data, joints):
 
         ankle_correction = (
 
-            -30 * pitch
-            -10 * torso_pitch_vel
+            -45 * pitch
+            -18 * torso_pitch_vel
         )
 
         ctrl[jid] = (
@@ -178,11 +194,15 @@ def compute_control(data, joints):
             )
 
             + ankle_correction
+
+            - 25 * vel
         )
 
+    # =====================================
     # FALL DETECTION
+    # =====================================
 
-    if abs(pitch) > 0.7:
+    if abs(pitch) > 0.8:
 
         for jid in ctrl:
 

@@ -73,25 +73,31 @@ with mujoco.viewer.launch_passive(
         # RIGHT HIP ROLL
         data.ctrl[7] = -150 * data.qpos[14]
 
-        # TORSO
-        # STARTUP TORSO SUPPORT
+        # TORSO STABILIZATION
+
+        TORSO_TARGET = 0.0
+
+        torso_pos = data.qpos[18]
+        torso_vel = data.qvel[17]
 
         if startup_steps < 300:
 
-            # hold torso upright initially
+            # strong startup torso stabilization
 
             data.ctrl[11] = (
-                -600 * data.qpos[18]
-                -80 * data.qvel[17]
+
+                -250 * data.qpos[18]
+                -40 * data.qvel[17]
             )
 
         else:
 
-            # softer torso stabilization after pose settles
+            # softer continuous torso stabilization
 
             data.ctrl[11] = (
-                -120 * data.qpos[18]
-                -20 * data.qvel[17]
+
+                -220 * (torso_pos - TORSO_TARGET)
+                -45 * torso_vel
             )
 
         # FREEZE ARMS
