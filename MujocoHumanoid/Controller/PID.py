@@ -8,17 +8,17 @@ print("PID FILE LOADED")
 
 # BALANCE GAINS
 
-Kp_balance = 60
-Kd_balance = 15
+Kp_balance = 35
+Kd_balance = 40
 
 # JOINT GAINS
 
 Kp_joint = 200
-Kd_joint = 20
+Kd_joint = 45
 
 # H1 NOMINAL STANDING POSE
 
-DESIRED_HIP = 0.28
+DESIRED_HIP = 0.18
 DESIRED_KNEE = -0.79
 DESIRED_ANKLE = 0.52
 
@@ -90,7 +90,7 @@ def compute_control(data, joints):
 
         -40 * com_x
         -10 * com_vx
-        + 0.5 * mpc_balance
+        + 0.15 * mpc_balance
     )
 
     # HIP CONTROL
@@ -117,7 +117,7 @@ def compute_control(data, joints):
                 Kd_joint
             )
 
-            - 0.15 * balance_pitch
+            - 0.05 * balance_pitch
         )
 
     # KNEE CONTROL
@@ -162,8 +162,8 @@ def compute_control(data, joints):
 
         ankle_correction = (
 
-            -25 * pitch
-            -8 * torso_pitch_vel
+            -30 * pitch
+            -10 * torso_pitch_vel
         )
 
         ctrl[jid] = (

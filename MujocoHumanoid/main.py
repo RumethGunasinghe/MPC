@@ -11,20 +11,20 @@ model = mujoco.MjModel.from_xml_path(
 
 data = mujoco.MjData(model)
 
+startup_steps = 0
+
 # INITIAL H1 STANDING POSE
 # NVIDIA / ISAAC STYLE
 
 # LEFT LEG
 
-data.qpos[10] = -0.28
-data.qpos[11] = 0.79
-data.qpos[12] = -0.52
+data.qpos[10] = 0.28
+data.qpos[11] = -0.79
+data.qpos[12] = 0.52
 
-# RIGHT LEG
-
-data.qpos[15] = -0.28
-data.qpos[16] = 0.79
-data.qpos[17] = -0.52
+data.qpos[15] = 0.28
+data.qpos[16] = -0.79
+data.qpos[17] = 0.52
 
 # ACTIVE JOINTS
 
@@ -76,6 +76,9 @@ with mujoco.viewer.launch_passive(
         for aid in [16, 17, 18]:
 
             data.ctrl[aid] = 0
+
+        # STARTUP STEPS
+        startup_steps += 1
 
         # BALANCE CONTROLLER
 
