@@ -7,15 +7,16 @@ class MPCController:
 
         self.dt = 0.02
 
-        self.horizon = 25
+        self.horizon = 20
 
         self.torque_candidates = np.linspace(
-            -40,
-            40,
-            41
+            -20,
+            20,
+            21
         )
 
     def predict_fall(
+
         self,
         pitch,
         pitch_vel
@@ -26,12 +27,13 @@ class MPCController:
 
         for _ in range(self.horizon):
 
-            future_vel += 0.01 * future_pitch
+            future_vel += 0.005 * future_pitch
             future_pitch += future_vel * self.dt
 
         return future_pitch
 
     def compute_balance(
+
         self,
         pitch,
         pitch_vel
@@ -53,9 +55,10 @@ class MPCController:
                 temp_pitch += temp_vel * self.dt
 
                 cost += (
-                    400 * temp_pitch**2
-                    + 30 * temp_vel**2
-                    + 0.02 * torque**2
+
+                    300 * temp_pitch**2
+                    + 20 * temp_vel**2
+                    + 0.05 * torque**2
                 )
 
             if cost < best_cost:
