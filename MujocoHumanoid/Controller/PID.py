@@ -144,7 +144,7 @@ def compute_control(data, joints):
                 Kd_joint
             )
 
-            + 80
+            + + 140
         )
 
     # ANKLE CONTROL

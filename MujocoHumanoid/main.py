@@ -3,6 +3,7 @@ import mujoco.viewer
 
 from Controller.PID import compute_control
 
+
 # LOAD MODEL
 
 model = mujoco.MjModel.from_xml_path(
@@ -11,20 +12,25 @@ model = mujoco.MjModel.from_xml_path(
 
 data = mujoco.MjData(model)
 
-startup_steps = 0
+# INITIAL H1 CROUCHED POSE
 
-# INITIAL H1 STANDING POSE
-# NVIDIA / ISAAC STYLE
+def set_initial_pose(data):
 
-# LEFT LEG
+    # LEFT LEG
 
-data.qpos[10] = 0.28
-data.qpos[11] = -0.79
-data.qpos[12] = 0.52
+    data.qpos[10] = 0.28
+    data.qpos[11] = -0.79
+    data.qpos[12] = 0.52
 
-data.qpos[15] = 0.28
-data.qpos[16] = -0.79
-data.qpos[17] = 0.52
+    # RIGHT LEG
+
+    data.qpos[15] = 0.28
+    data.qpos[16] = -0.79
+    data.qpos[17] = 0.52
+
+# apply startup pose
+
+set_initial_pose(data)
 
 # ACTIVE JOINTS
 
@@ -38,6 +44,9 @@ joints = {
     "RIGHT_KNEE": 9,
     "RIGHT_ANKLE": 10,
 }
+
+# STARTUP TIMER
+startup_steps = 0
 
 # MAIN LOOP
 
@@ -65,7 +74,25 @@ with mujoco.viewer.launch_passive(
         data.ctrl[7] = -150 * data.qpos[14]
 
         # TORSO
-        data.ctrl[11] = -80 * data.qpos[18]
+        # STARTUP TORSO SUPPORT
+
+        if startup_steps < 300:
+
+            # hold torso upright initially
+
+            data.ctrl[11] = (
+                -600 * data.qpos[18]
+                -80 * data.qvel[17]
+            )
+
+        else:
+
+            # softer torso stabilization after pose settles
+
+            data.ctrl[11] = (
+                -120 * data.qpos[18]
+                -20 * data.qvel[17]
+            )
 
         # FREEZE ARMS
 
@@ -96,6 +123,8 @@ with mujoco.viewer.launch_passive(
                 data.ctrl[jid] += torque
 
         # STEP PHYSICS
+        if data.time < 0.05:
+            set_initial_pose(data)
 
         mujoco.mj_step(
             model,
