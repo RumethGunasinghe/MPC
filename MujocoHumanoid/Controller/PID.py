@@ -7,17 +7,14 @@ from Controller.COM import compute_com
 print("PID FILE LOADED")
 
 # BALANCE GAINS
-
 Kp_balance = 25
 Kd_balance = 55
 
 # JOINT GAINS
-
 Kp_joint = 220
 Kd_joint = 60
 
 # H1 CROUCHED STANCE
-
 DESIRED_HIP = 0.28
 DESIRED_KNEE = -0.79
 DESIRED_ANKLE = 0.52
@@ -65,26 +62,20 @@ def compute_control(data, joints):
 
     ctrl = {}
 
-    # =====================================
     # BODY ORIENTATION
-    # =====================================
 
     roll, pitch = get_torso_angles(data)
 
     torso_pitch_vel = qd[4]
 
-    # =====================================
     # COM ESTIMATION
-    # =====================================
 
     com = compute_com(data)
 
     com_x = com["x"]
     com_vx = com["vx"]
 
-    # =====================================
     # MPC BALANCE
-    # =====================================
 
     mpc_balance = mpc.compute_balance(
 
@@ -92,9 +83,7 @@ def compute_control(data, joints):
         torso_pitch_vel
     )
 
-    # =====================================
     # COM BALANCE
-    # =====================================
 
     balance_pitch = (
 
@@ -103,9 +92,7 @@ def compute_control(data, joints):
         + 0.05 * mpc_balance
     )
 
-    # =====================================
     # HIP CONTROL
-    # =====================================
 
     for joint in [
 
@@ -132,9 +119,7 @@ def compute_control(data, joints):
             - 0.03 * balance_pitch
         )
 
-    # =====================================
     # KNEE CONTROL
-    # =====================================
 
     for joint in [
 
@@ -161,9 +146,7 @@ def compute_control(data, joints):
             + 140
         )
 
-    # =====================================
     # ANKLE CONTROL
-    # =====================================
 
     for joint in [
 
@@ -198,9 +181,7 @@ def compute_control(data, joints):
             - 25 * vel
         )
 
-    # =====================================
     # FALL DETECTION
-    # =====================================
 
     if abs(pitch) > 0.8:
 
