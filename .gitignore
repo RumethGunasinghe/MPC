@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Run artefacts
+data/runs/
+data/figures/
+*.npz
+*.csv
+*.pt
+*.ckpt
+runs/
+
+# MuJoCo assets (large binaries, fetched from mujoco_menagerie)
+models/unitree_h1/meshes/
+*.stl
+*.obj
+
+# Tooling
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/

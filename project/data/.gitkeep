@@ -1,0 +1,2 @@
+# Run artefacts land here: data/runs/ (logs, checkpoints) and data/figures/ (plots).
+# Contents are gitignored; this file keeps the directory in version control.
