@@ -1,7 +1,11 @@
 import mujoco
 import mujoco.viewer
 
-from Controller.PID import compute_control
+from Controller.PID import compute_walking_control, get_torso_angles
+from walking.walking_gait import WalkingGait
+from walking.foot_trajectory import FootTrajectory
+from walking.inverse_kinematics import leg_ik
+from walking.walking_controller import get_leg_targets
 
 
 # LOAD MODEL
@@ -11,6 +15,8 @@ model = mujoco.MjModel.from_xml_path(
 )
 
 data = mujoco.MjData(model)
+gait = WalkingGait()
+foot_traj = FootTrajectory()
 
 # INITIAL H1 CROUCHED POSE
 
@@ -110,16 +116,29 @@ with mujoco.viewer.launch_passive(
 
             data.ctrl[aid] = 0
 
+        phase = gait.update(
+
+            model.opt.timestep
+
+        )
+
+        progress = gait.get_phase_progress()
+
+
+        targets = get_leg_targets(
+            phase,
+            progress
+        )
         # STARTUP STEPS
         startup_steps += 1
 
         # BALANCE CONTROLLER
 
-        ctrl = compute_control(
+        ctrl = compute_walking_control(
             data,
-            joints
+            joints,
+            targets
         )
-
         # APPLY CONTROLS
 
         for jid, torque in ctrl.items():
@@ -135,6 +154,16 @@ with mujoco.viewer.launch_passive(
         mujoco.mj_step(
             model,
             data
+        )
+
+        roll, pitch = get_torso_angles(data)
+
+        com_x = data.qpos[0]
+
+        print(
+            f"t={data.time:.2f} | "
+            f"pitch={pitch:.3f} | "
+            f"com_x={com_x:.3f}"
         )
 
         viewer.sync()
