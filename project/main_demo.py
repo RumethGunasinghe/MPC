@@ -4,16 +4,16 @@ The control stack on every tick is
 
     state -> WholeBodyMPC -> PDController -> CBFFilter -> joint torques -> MuJoCo
 
-The MPC holds the torso attitude recorded at reset and holds the centre of
-mass over the middle of the feet. The PD layer turns the resulting joint targets
-into a nominal torque, and the CBF filter projects that torque onto the set
-that keeps the centre of mass inside the support box and inside the actuator
-limits. The safe torque is what the simulator applies.
+The MPC holds the torso attitude recorded at reset. In walking mode the
+centre-of-mass reference travels forward at a constant speed while both feet
+stay planted, so the motion is a double-support weight shift, not a step.
+The PD layer turns the resulting joint targets into a nominal torque, and the
+CBF filter projects that torque onto the set that keeps the centre of mass
+inside the support box and inside the actuator limits.
 
-At t = 2 s a horizontal force is applied to the torso, standing in for a
-heavy manipulation load. The viewer stays open until the window is closed.
-COM position, COM velocity and the size of each safety intervention are
-written to ``data/demo_log.npz`` when the window closes.
+At t = 2 s a horizontal force is applied to the torso when walking mode is
+off. COM position, the COM reference and the tracking error are written to
+``data/demo_log.npz`` when the window closes.
 
 Usage:
     python main_demo.py
@@ -43,6 +43,11 @@ PUSH_TIME = 2.0  # seconds
 PUSH_FORCE = np.array([80.0, 0.0, 0.0])  # newtons
 PUSH_DURATION = 0.2  # seconds
 PUSH_BODY_CANDIDATES = ("torso_link", "torso", "pelvis")
+
+# Double-support weight shift. Both feet stay planted; only the CoM reference
+# moves. 0.05 m/s is slow enough for the ankles to keep the centre of pressure
+# under the moving mass.
+WALK_SPEED = 0.05  # m/s, world +x
 
 
 def build_stack(
@@ -101,6 +106,67 @@ def stand_reference(
     }
 
 
+def foot_support_x(env: IndustrialHumanoidEnv) -> tuple[float, float, float]:
+    """Heel, toe and midpoint along world x, from the ankle positions.
+
+    The H1 sole runs from about 3.5 cm behind the ankle joint to 14 cm in
+    front of it. Both feet share that forward axis in the home pose.
+    """
+    import mujoco
+
+    model, data = env.model, env.data
+    ankle_x = []
+    for body_id in range(int(model.nbody)):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if "ankle" in name:
+            ankle_x.append(float(data.xpos[body_id][0]))
+    if not ankle_x:
+        com_x = float(env.get_com_position()[0])
+        return com_x, com_x, com_x
+    heel = min(ankle_x) - 0.035
+    toe = max(ankle_x) + 0.14
+    return heel, toe, 0.5 * (heel + toe)
+
+
+def walking_reference(
+    env: IndustrialHumanoidEnv,
+    torso: np.ndarray,
+    origin_xy: np.ndarray,
+    height: float,
+    speed: float,
+    time_s: float,
+    horizon: int,
+    dt: float,
+    x_limits: tuple[float, float],
+) -> dict[str, np.ndarray]:
+    """CoM reference that travels forward at ``speed`` with both feet planted.
+
+    Knot ``k`` is the position at ``time_s + k dt``. The x coordinate is held
+    at the edge of the sole once the ramp reaches it: past the toe there is
+    no contact left to balance on, and this mode does not take a step.
+    The velocity reference is the slope of that clipped ramp, so the MPC
+    tracks 0.05 m/s in the interior and zero once the weight is fully forward.
+    """
+    times = float(time_s) + float(dt) * np.arange(horizon)
+    x = np.clip(float(origin_xy[0]) + float(speed) * times, x_limits[0], x_limits[1])
+    com = np.column_stack(
+        (
+            x,
+            np.full(horizon, float(origin_xy[1])),
+            np.full(horizon, float(height)),
+        )
+    )
+    velocity = np.zeros((horizon, 3))
+    if horizon > 1 and dt > 0.0:
+        velocity[:-1, 0] = np.diff(x) / dt
+        velocity[-1, 0] = velocity[-2, 0]
+    return {
+        "com": com,
+        "com_velocity": velocity,
+        "torso_orientation": np.asarray(torso, dtype=float).copy(),
+    }
+
+
 def control_step(
     env: IndustrialHumanoidEnv,
     mpc: WholeBodyMPC,
@@ -145,9 +211,15 @@ def control_step(
     env.step_feedback(torque_at_substep)
 
     after = env.get_state()
+    ref_com = np.asarray(reference["com"], dtype=float)
+    if ref_com.ndim == 2:
+        ref_com = ref_com[0]
+    ref_com = ref_com.reshape(3)
     return {
         "time": float(np.asarray(after["time"]).reshape(-1)[0]),
         "com": after["com"].copy(),
+        "com_reference": ref_com.copy(),
+        "com_error": after["com"] - ref_com,
         "com_velocity": after["com_velocity"].copy(),
         "intervention": float(np.linalg.norm(tau_safe - tau_nominal)),
         "cbf_status": cbf.status,
@@ -158,7 +230,22 @@ def control_step(
         "joint_qvel": after["joint_qvel"].copy(),
         "base_rotation": after["base_rotation"].copy(),
         "barriers": cbf.com_barrier_values(after["com"]),
+        "ankle_xy": _ankle_positions(env),
     }
+
+
+def _ankle_positions(env: IndustrialHumanoidEnv) -> np.ndarray:
+    """World xy of each ankle body, shape ``(n, 2)``, to check the feet stay put."""
+    import mujoco
+
+    points = []
+    for body_id in range(int(env.model.nbody)):
+        name = mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if "ankle" in name:
+            points.append(np.asarray(env.data.xpos[body_id][:2], dtype=float))
+    if not points:
+        return np.zeros((0, 2))
+    return np.vstack(points)
 
 
 def apply_push(env: IndustrialHumanoidEnv, force: np.ndarray) -> str:
@@ -179,27 +266,38 @@ def apply_push(env: IndustrialHumanoidEnv, force: np.ndarray) -> str:
 
 
 def save_log(path: Path, rows: list[dict]) -> None:
-    """Write COM position, COM velocity and safety interventions to ``path``."""
+    """Write COM position, the COM reference and the tracking error to ``path``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     time_s = np.array([row["time"] for row in rows])
     com = np.vstack([row["com"] for row in rows])
+    com_reference = np.vstack([row["com_reference"] for row in rows])
+    com_error = np.vstack([row["com_error"] for row in rows])
     com_velocity = np.vstack([row["com_velocity"] for row in rows])
     intervention = np.array([row["intervention"] for row in rows])
     status = np.array([row["cbf_status"] for row in rows])
+    ankle_xy = np.stack([row["ankle_xy"] for row in rows])
     np.savez(
         path,
         time=time_s,
         com=com,
+        com_reference=com_reference,
+        com_error=com_error,
         com_velocity=com_velocity,
         intervention=intervention,
         cbf_status=status,
+        ankle_xy=ankle_xy,
     )
     csv_path = path.with_suffix(".csv")
-    header = "time,com_x,com_y,com_z,com_vx,com_vy,com_vz,intervention,cbf_status"
+    header = (
+        "time,com_x,com_y,com_z,ref_x,ref_y,ref_z,err_x,err_y,err_z,"
+        "com_vx,com_vy,com_vz,intervention,cbf_status"
+    )
     lines = [header]
     for i in range(time_s.size):
         lines.append(
             f"{time_s[i]:.4f},{com[i, 0]:.6f},{com[i, 1]:.6f},{com[i, 2]:.6f},"
+            f"{com_reference[i, 0]:.6f},{com_reference[i, 1]:.6f},{com_reference[i, 2]:.6f},"
+            f"{com_error[i, 0]:.6f},{com_error[i, 1]:.6f},{com_error[i, 2]:.6f},"
             f"{com_velocity[i, 0]:.6f},{com_velocity[i, 1]:.6f},{com_velocity[i, 2]:.6f},"
             f"{intervention[i]:.6f},{status[i]}"
         )
@@ -212,17 +310,51 @@ def run_demo(args: argparse.Namespace) -> Path:
 
     env, mpc, cbf, pd = build_stack(args)
     env.reset(seed=args.seed)
-    reference = stand_reference(env, env.get_state())
+    state0 = env.get_state()
+    fixed_reference = stand_reference(env, state0)
+    torso = np.asarray(state0["torso_rotation"], dtype=float).copy()
+    height = float(state0["com"][2])
+    heel, toe, _mid = foot_support_x(env)
+    margin = float(cbf.config.margin)
+    # The barrier box has to cover the sole. The default box is centred on the
+    # home CoM, which sits on the heels, so a forward weight shift would be
+    # rejected immediately.
+    if args.walk:
+        # Start the ramp on the centre of mass, not on the middle of the sole.
+        # A target that is already 6 cm ahead saturates the ankles and the
+        # robot falls backward. Stop 2 cm short of the toe: both feet stay
+        # down, so the weight cannot be shifted past the end of the sole.
+        origin_xy = np.asarray(state0["com"][:2], dtype=float).copy()
+        x_max = toe - 0.02
+        x_min = float(origin_xy[0])
+        x_limits = (x_min, x_max)
+        rear = float(origin_xy[0]) - 0.04
+        box_center = 0.5 * (rear + x_max)
+        half_x = 0.5 * (x_max - rear) + margin
+        cbf.config.support_center = (box_center, float(origin_xy[1]))
+        cbf.config.support_half_extents = (half_x, cbf.config.support_half_extents[1])
+    else:
+        x_limits = (heel, toe)
+        origin_xy = sole_center_xy(env)
     log_path = Path(args.log_path)
     rows: list[dict] = []
     pushed = False
     next_report = 1.0
 
-    LOG.info(
-        "viewer open — close the window to stop. Push of %.0f N at t = %.1f s.",
-        float(np.linalg.norm(args.push_force)),
-        PUSH_TIME,
-    )
+    if args.walk:
+        LOG.info(
+            "viewer open — close the window to stop. Walking at %.2f m/s, both feet planted. "
+            "CoM reference x from %.3f m to %.3f m.",
+            float(args.walk_speed),
+            x_limits[0],
+            x_limits[1],
+        )
+    else:
+        LOG.info(
+            "viewer open — close the window to stop. Push of %.0f N at t = %.1f s.",
+            float(np.linalg.norm(args.push_force)),
+            PUSH_TIME,
+        )
 
     # launch_passive returns immediately. The loop below is what keeps the
     # window alive; is_running() goes false when the user closes it.
@@ -232,16 +364,30 @@ def run_demo(args: argparse.Namespace) -> Path:
             tick = time.perf_counter()
             sim_time = float(env.data.time)
 
-            if not pushed and sim_time >= PUSH_TIME:
-                body = apply_push(env, np.asarray(args.push_force, dtype=float))
-                pushed = True
-                LOG.info(
-                    "t = %.2f s: applied %s N for %.2f s on %s",
+            if args.walk:
+                reference = walking_reference(
+                    env,
+                    torso,
+                    origin_xy,
+                    height,
+                    float(args.walk_speed),
                     sim_time,
-                    np.array2string(np.asarray(args.push_force), precision=0),
-                    PUSH_DURATION,
-                    body,
+                    mpc.config.horizon,
+                    mpc.config.dt,
+                    x_limits,
                 )
+            else:
+                reference = fixed_reference
+                if not pushed and sim_time >= PUSH_TIME:
+                    body = apply_push(env, np.asarray(args.push_force, dtype=float))
+                    pushed = True
+                    LOG.info(
+                        "t = %.2f s: applied %s N for %.2f s on %s",
+                        sim_time,
+                        np.array2string(np.asarray(args.push_force), precision=0),
+                        PUSH_DURATION,
+                        body,
+                    )
 
             row = control_step(env, mpc, cbf, pd, reference)
             rows.append(row)
@@ -250,13 +396,18 @@ def run_demo(args: argparse.Namespace) -> Path:
             if row["time"] >= next_report:
                 com = row["com"]
                 vel = row["com_velocity"]
+                err = row["com_error"]
                 LOG.info(
-                    "t = %5.2f s | COM [%.3f %.3f %.3f] m | |v| = %.3f m/s | "
-                    "intervention %.2f Nm (%s)",
+                    "t = %5.2f s | COM [%.3f %.3f %.3f] m | ref x %.3f m | "
+                    "error [%.3f %.3f %.3f] m | |v| = %.3f m/s | intervention %.2f Nm (%s)",
                     row["time"],
                     com[0],
                     com[1],
                     com[2],
+                    row["com_reference"][0],
+                    err[0],
+                    err[1],
+                    err[2],
                     float(np.linalg.norm(vel)),
                     row["intervention"],
                     row["cbf_status"],
@@ -289,6 +440,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=20, help="MPC horizon length")
     parser.add_argument("--control-dt", type=float, default=0.02, help="control period in seconds")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--walk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="move the CoM reference forward at --walk-speed with both feet planted",
+    )
+    parser.add_argument(
+        "--walk-speed",
+        type=float,
+        default=WALK_SPEED,
+        help="forward CoM reference speed in m/s (walking mode)",
+    )
     parser.add_argument(
         "--push-force",
         type=float,
