@@ -1,1 +1,1 @@
-"""Whole-body MPC and joint-space PD controllers."""
+"""Whole-body MPC, joint-space PD, and footstep planning."""
