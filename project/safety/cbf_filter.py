@@ -141,7 +141,12 @@ class CBFConfig:
 
 
 class CBFFilter:
-    """Minimally invasive torque filter keeping the CoM inside the support box.
+    """Minimally invasive torque filter keeping the CoM inside the support polygon.
+
+    The barrier is the axis-aligned box of the polygon last passed to
+    :meth:`set_support_polygon`. While both feet are down that box covers both
+    soles. During a swing it covers only the stance sole, so the support
+    region changes with the step.
 
     Inputs of :meth:`safe_torque` are the nominal torque command and the
     centre-of-mass position and velocity. The output is a torque of the same
@@ -484,6 +489,28 @@ class CBFFilter:
         for spec in self.barriers:
             values[spec.name] = float(spec.h(state))
         return values
+
+    def set_support_polygon(self, vertices: np.ndarray) -> None:
+        """Aim the CoM barrier at the feet that are currently on the ground.
+
+        ``vertices`` is an ``(n, 2)`` array of world-frame sole corners. The
+        filter's constraint is a box, so the polygon is reduced to its
+        axis-aligned bounds. For the H1 soles, which are aligned with the
+        world axes, those bounds are the polygon. The QP reads the center and
+        the half extents on the next solve; it does not need to be rebuilt.
+        """
+        points = np.asarray(vertices, dtype=float).reshape(-1, 2)
+        if points.shape[0] == 0:
+            raise ValueError("support polygon needs at least one vertex")
+        low = points.min(axis=0)
+        high = points.max(axis=0)
+        center = 0.5 * (low + high)
+        half = 0.5 * (high - low)
+        # A face inside the margin would make the safe set empty and the
+        # filter would push the CoM even when it is standing on the sole.
+        half = np.maximum(half, float(self.config.margin) + 1e-3)
+        self.config.support_center = (float(center[0]), float(center[1]))
+        self.config.support_half_extents = (float(half[0]), float(half[1]))
 
     def com_barrier_values(self, com_position: np.ndarray) -> dict[str, float]:
         """Signed distance of the CoM to each face of the support box.

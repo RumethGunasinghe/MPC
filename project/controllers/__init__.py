@@ -1,1 +1,1 @@
-"""Whole-body MPC, joint-space PD, and footstep planning."""
+"""Whole-body MPC, joint-space PD, footstep planning, leg inverse kinematics, lateral weight shift, and the walking state machine."""

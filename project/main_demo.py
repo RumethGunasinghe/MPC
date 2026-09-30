@@ -4,12 +4,14 @@ The control stack on every tick is
 
     state -> WholeBodyMPC -> PDController -> CBFFilter -> joint torques -> MuJoCo
 
-The MPC holds the torso attitude recorded at reset. In walking mode the
-centre-of-mass reference travels forward at a constant speed while both feet
-stay planted, so the motion is a double-support weight shift, not a step.
-The PD layer turns the resulting joint targets into a nominal torque, and the
-CBF filter projects that torque onto the set that keeps the centre of mass
-inside the support box and inside the actuator limits.
+The MPC holds the torso attitude recorded at reset. In walking mode a state
+machine shifts the centre of mass onto the measured centre of one sole before
+the other foot swings forward. The shift is a blend from the home posture to
+the leg pose that reaches that sole with both feet planted. The swing leg
+tracks its foot with inverse kinematics, and only after the centre of mass is
+inside the stance sole. The CBF keeps the centre of mass inside the soles
+that are on the ground, and that region shrinks to the stance foot while a
+foot is in the air.
 
 At t = 2 s a horizontal force is applied to the torso when walking mode is
 off. COM position, the COM reference and the tracking error are written to
@@ -27,8 +29,11 @@ from pathlib import Path
 
 import numpy as np
 
+from controllers.lateral_shift import LateralWeightShift, support_distance
+from controllers.leg_ik import LegIK
 from controllers.mpc_controller import MPCConfig, WholeBodyMPC
 from controllers.pd_controller import PDController
+from controllers.walk_state_machine import WalkConfig, WalkingStateMachine, WalkState
 from env.industrial_humanoid_env import EnvConfig, IndustrialHumanoidEnv
 from safety.cbf_filter import CBFConfig, CBFFilter
 from utils.logger import get_console_logger
@@ -44,10 +49,26 @@ PUSH_FORCE = np.array([80.0, 0.0, 0.0])  # newtons
 PUSH_DURATION = 0.2  # seconds
 PUSH_BODY_CANDIDATES = ("torso_link", "torso", "pelvis")
 
-# Double-support weight shift. Both feet stay planted; only the CoM reference
-# moves. 0.05 m/s is slow enough for the ankles to keep the centre of pressure
-# under the moving mass.
+# Double-support weight shift used only by ``--no-walk`` is not this constant.
+# Walking steps use the state machine below. 0.05 m/s remains the slow
+# reference speed of the planted-foot mode.
 WALK_SPEED = 0.05  # m/s, world +x
+
+# Sole corners in the ankle frame, metres. The capsules run from 3.5 cm
+# behind the ankle to 14 cm in front. Width is the capsule radius: the toe
+# bar is wider, but the centre of mass has to sit on the part of the sole
+# that is actually under the ankle, or the foot rolls over.
+_SOLE_CORNERS = np.array(
+    [
+        [-0.035, -0.02, 0.0],
+        [0.140, -0.02, 0.0],
+        [0.140, 0.02, 0.0],
+        [-0.035, 0.02, 0.0],
+    ]
+)
+# The middle of that sole, used so the CoM target sits on the foot rather
+# than on the ankle joint.
+_SOLE_CENTER = np.array([0.0525, 0.0, 0.0])
 
 
 def build_stack(
@@ -173,6 +194,13 @@ def control_step(
     cbf: CBFFilter,
     pd: PDController,
     reference: dict[str, np.ndarray],
+    stance: tuple[str, ...] | None = None,
+    joint_pose: dict[str, float] | None = None,
+    swing_side: str | None = None,
+    walk_state: str = "STAND",
+    support_foot: str = "both",
+    stance_hip_roll: tuple[str, float] | None = None,
+    posture: LateralWeightShift | None = None,
 ) -> dict[str, np.ndarray | float | str]:
     """One control tick: MPC, PD, CBF, then torque into MuJoCo.
 
@@ -181,8 +209,33 @@ def control_step(
     unchanged.
     """
     state = env.get_state()
+    if stance is not None:
+        contacts = state.get("contact_jacobians") or {}
+        planted = {
+            name: jac
+            for name, jac in contacts.items()
+            if any(side in name for side in stance)
+        }
+        # During a swing the moving foot is not a contact. The CoM Jacobian
+        # is taken relative to the stance foot only.
+        if planted:
+            state = dict(state)
+            state["contact_jacobians"] = planted
     solution = mpc.solve(state, reference)
     q_des = solution["q_des"]
+    if joint_pose is not None:
+        q_des = _compose_step_joints(mpc, q_des, joint_pose, swing_side)
+    if stance_hip_roll is not None:
+        roll_side, roll_angle = stance_hip_roll
+        for index, name in enumerate(mpc._joint_names):
+            if name == f"{roll_side}_hip_roll":
+                q_des[index] = float(np.clip(roll_angle, mpc._joint_low[index], mpc._joint_high[index]))
+    if posture is not None:
+        # The shift posture replaces the leg targets. It is solved from the
+        # measured feet; the MPC's fore-aft residual is kept inside apply().
+        q_des = posture.apply(
+            q_des, mpc._joint_names, mpc._home_joint_qpos, mpc._joint_low, mpc._joint_high
+        )
     qd_des = solution["qd_des"]
 
     # One CBF solve per control tick. The modification ``delta`` is held across
@@ -231,6 +284,9 @@ def control_step(
         "base_rotation": after["base_rotation"].copy(),
         "barriers": cbf.com_barrier_values(after["com"]),
         "ankle_xy": _ankle_positions(env),
+        "walk_state": walk_state,
+        "support_foot": support_foot,
+        "com_acceleration_des": np.asarray(solution["com_acceleration"], dtype=float).copy(),
     }
 
 
@@ -246,6 +302,244 @@ def _ankle_positions(env: IndustrialHumanoidEnv) -> np.ndarray:
     if not points:
         return np.zeros((0, 2))
     return np.vstack(points)
+
+
+def _hold_landed_leg(mpc: WholeBodyMPC, joint_pose: dict[str, float], side: str) -> None:
+    """Make the landed swing leg the posture the MPC holds."""
+    prefix = f"{side}_"
+    for index, name in enumerate(mpc._joint_names):
+        if name.startswith(prefix) and name in joint_pose:
+            mpc._home_joint_qpos[index] = float(joint_pose[name])
+
+
+def _compose_step_joints(
+    mpc: WholeBodyMPC,
+    q_mpc: np.ndarray,
+    joint_pose: dict[str, float],
+    swing_side: str | None,
+) -> np.ndarray:
+    """Put the legs on the inverse-kinematics pose, and keep balance on the stance leg.
+
+    The MPC computes joint targets as a deviation from the home pose. After a
+    step the feet are no longer at home, so the leg targets are rebuilt on the
+    inverse-kinematics pose. The swing leg follows that pose exactly. The
+    stance leg keeps the MPC's small balance correction, clipped so a bad
+    Jacobian step cannot fold the knee.
+    """
+    home = np.asarray(mpc._home_joint_qpos, dtype=float)
+    q_des = np.asarray(q_mpc, dtype=float).copy()
+    for index, name in enumerate(mpc._joint_names):
+        side = "left" if name.startswith("left_") else "right" if name.startswith("right_") else ""
+        if side == "":
+            continue
+        if side == swing_side:
+            if name in joint_pose:
+                q_des[index] = joint_pose[name]
+            elif "hip_roll" in name or "hip_yaw" in name:
+                q_des[index] = home[index]
+            continue
+        if name in joint_pose:
+            correction = float(q_mpc[index] - home[index])
+            q_des[index] = joint_pose[name] + float(np.clip(correction, -0.2, 0.2))
+    return np.clip(q_des, mpc._joint_low, mpc._joint_high)
+
+
+def _ankle_pose(env: IndustrialHumanoidEnv, side: str) -> tuple[np.ndarray, np.ndarray]:
+    """World position and rotation of one ankle body."""
+    import mujoco
+
+    body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_ankle_link")
+    if body_id < 0:
+        raise ValueError(f"model has no body {side}_ankle_link")
+    position = np.asarray(env.data.xpos[body_id], dtype=float).copy()
+    rotation = np.asarray(env.data.xmat[body_id], dtype=float).reshape(3, 3).copy()
+    return position, rotation
+
+
+def sole_corners(env: IndustrialHumanoidEnv, side: str) -> np.ndarray:
+    """World xy corners of one sole, shape ``(4, 2)``."""
+    position, rotation = _ankle_pose(env, side)
+    world = position + (_SOLE_CORNERS @ rotation.T)
+    return world[:, :2]
+
+
+def support_polygon(env: IndustrialHumanoidEnv, stance: tuple[str, ...]) -> np.ndarray:
+    """Corners of every sole that is currently carrying weight."""
+    return np.vstack([sole_corners(env, side) for side in stance])
+
+
+def build_step_command(
+    env: IndustrialHumanoidEnv,
+    gait: WalkingStateMachine,
+    ik: LegIK,
+    torso: np.ndarray,
+    time_s: float,
+    horizon: int,
+    dt: float,
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, float], str | None, object]:
+    """MPC reference, support polygon and leg pose for one walking tick.
+
+    The centre-of-mass preview follows the state machine, shifted from the
+    ankle onto the middle of the sole. The polygon covers both feet except
+    during a swing, when it covers only the stance sole.
+    """
+    times = float(time_s) + float(dt) * np.arange(horizon)
+    samples = [gait.sample(float(tk)) for tk in times]
+    com = np.vstack([sample.com_target for sample in samples])
+    com[:, 0] += _SOLE_CENTER[0]
+    velocity = np.zeros_like(com)
+    if horizon > 1 and dt > 0.0:
+        velocity[:-1] = np.diff(com, axis=0) / dt
+        velocity[-1] = velocity[-2]
+    reference = {
+        "com": com,
+        "com_velocity": velocity,
+        "torso_orientation": np.asarray(torso, dtype=float).copy(),
+    }
+    now = samples[0]
+    if now.state is WalkState.RIGHT_SWING:
+        stance: tuple[str, ...] = ("left",)
+        swing: str | None = "right"
+    elif now.state is WalkState.LEFT_SWING:
+        stance = ("right",)
+        swing = "left"
+    else:
+        stance = ("left", "right")
+        swing = None
+    pose: dict[str, float] = {}
+    for side, foot in (("left", now.left_foot), ("right", now.right_foot)):
+        joints = ik.solve(foot, env, side=side)
+        pose[f"{side}_hip_pitch"] = joints.hip_pitch
+        pose[f"{side}_knee"] = joints.knee
+        pose[f"{side}_ankle"] = joints.ankle_pitch
+    return reference, support_polygon(env, stance), pose, swing, now
+
+
+def _com_over_foot(env: IndustrialHumanoidEnv, side: str) -> bool:
+    """True when the centre of mass is clearly inside one sole."""
+    sole = support_polygon(env, (side,))
+    com_xy = np.asarray(env.get_state()["com"][:2], dtype=float)
+    low = sole.min(axis=0) + 0.01
+    high = sole.max(axis=0) - 0.01
+    if np.any(high <= low):
+        low = sole.min(axis=0)
+        high = sole.max(axis=0)
+    return bool(np.all(com_xy >= low) and np.all(com_xy <= high))
+
+
+def walk_tick(
+    env: IndustrialHumanoidEnv,
+    mpc: WholeBodyMPC,
+    cbf: CBFFilter,
+    pd: PDController,
+    gait: WalkingStateMachine,
+    ik: LegIK,
+    torso: np.ndarray,
+    rows: list[dict],
+) -> dict:
+    """One stepping tick: shift, swing, polygon update, then MPC-PD-CBF."""
+    loaded = gait.loaded_foot
+    ready = _com_over_foot(env, loaded) if loaded is not None else True
+    command = gait.update(mpc.config.dt, ready)
+    horizon = mpc.config.horizon
+    com = np.tile(np.asarray(command.com_target, dtype=float), (horizon, 1))
+    com[:, 0] += _SOLE_CENTER[0]
+    reference = {
+        "com": com,
+        "com_velocity": np.zeros_like(com),
+        "torso_orientation": np.asarray(torso, dtype=float).copy(),
+    }
+    swing = (
+        "right"
+        if command.state is WalkState.RIGHT_SWING
+        else "left"
+        if command.state is WalkState.LEFT_SWING
+        else None
+    )
+    stance = ("left",) if swing == "right" else ("right",) if swing == "left" else None
+    polygon = support_polygon(env, stance if stance is not None else ("left", "right"))
+    # Do not lift, and do not shrink the polygon to one sole, until the centre
+    # of mass is inside that sole. Lifting earlier drops the robot.
+    if swing is not None and stance is not None:
+        sole = support_polygon(env, stance)
+        com_xy = np.asarray(env.get_state()["com"][:2], dtype=float)
+        inside = bool(np.all(com_xy >= sole.min(axis=0)) and np.all(com_xy <= sole.max(axis=0)))
+        if not inside:
+            swing = None
+            stance = None
+            polygon = support_polygon(env, ("left", "right"))
+    cbf.set_support_polygon(polygon)
+    pose: dict[str, float] = {}
+    for side, foot in (("left", command.left_foot), ("right", command.right_foot)):
+        joints = ik.solve(foot, env, side=side)
+        pose[f"{side}_hip_pitch"] = joints.hip_pitch
+        pose[f"{side}_knee"] = joints.knee
+        pose[f"{side}_ankle"] = joints.ankle_pitch
+    # Planted legs stay on the MPC posture. Inverse kinematics is applied only
+    # to the leg that is in the air. When that foot lands, its joint targets
+    # become the new posture so the MPC does not pull the foot back home.
+    previous_swing = str(rows[-1]["swing_side"]) if rows else ""
+    if swing is None and previous_swing:
+        _hold_landed_leg(mpc, pose, previous_swing)
+    # The state machine already names the stance ankle. That y coordinate is
+    # thrown away by a midline reference, which is why the old shift stopped
+    # at a few centimetres. Track the centre of the measured sole instead.
+    shift = _weight_shift(gait, env.model)
+    state_now = env.get_state()
+    loaded = gait.loaded_foot
+    if loaded is not None and swing is None:
+        sole = sole_corners(env, loaded)
+        if shift.side != loaded:
+            left_ankle, _left_rot = _ankle_pose(env, "left")
+            right_ankle, _right_rot = _ankle_pose(env, "right")
+            home = {name: float(q) for name, q in zip(mpc._joint_names, mpc._home_joint_qpos)}
+            shift.begin(loaded, left_ankle, right_ankle, state_now["com"], sole, home)
+        ref_xy = shift.advance(mpc.config.dt, state_now["com"], state_now["com_velocity"])
+        com[:, 0] = ref_xy[0]
+        com[:, 1] = ref_xy[1]
+        reference["com"] = com
+        active_posture: LateralWeightShift | None = shift
+        stance_sole = sole
+        stance_xy = shift.target_xy.copy()
+    else:
+        active_posture = None
+        both = support_polygon(env, ("left", "right"))
+        stance_sole = both
+        stance_xy = both.mean(axis=0)
+    row = control_step(
+        env,
+        mpc,
+        cbf,
+        pd,
+        reference,
+        stance=stance,
+        joint_pose=pose if swing is not None else None,
+        swing_side=swing,
+        walk_state=command.state.value,
+        support_foot=command.support_foot,
+        posture=active_posture,
+    )
+    row["swing_side"] = swing or ""
+    row["stance_foot_xy"] = np.asarray(stance_xy, dtype=float).reshape(2)
+    row["support_distance"] = support_distance(row["com"][:2], stance_sole)
+    row["shift_fraction"] = float(shift.fraction)
+    row["shift_limit"] = shift.limit
+    names = list(mpc._joint_names)
+    for side in ("left", "right"):
+        index = names.index(f"{side}_hip_roll")
+        row[f"{side}_hip_roll_des"] = float(row["q_des"][index])
+        row[f"{side}_hip_roll"] = float(row["joint_qpos"][index])
+        row[f"{side}_hip_roll_torque"] = float(row["tau_safe"][index])
+    return row
+
+
+def _weight_shift(gait: WalkingStateMachine, model) -> LateralWeightShift:
+    """One shift solver per gait, created on the first tick."""
+    shift = getattr(gait, "_lateral_shift", None)
+    if shift is None or shift.model is not model:
+        shift = LateralWeightShift(model)
+        gait._lateral_shift = shift
+    return shift
 
 
 def apply_push(env: IndustrialHumanoidEnv, force: np.ndarray) -> str:
@@ -276,6 +570,12 @@ def save_log(path: Path, rows: list[dict]) -> None:
     intervention = np.array([row["intervention"] for row in rows])
     status = np.array([row["cbf_status"] for row in rows])
     ankle_xy = np.stack([row["ankle_xy"] for row in rows])
+    walk_state = np.array([row.get("walk_state", "STAND") for row in rows])
+    support_foot = np.array([row.get("support_foot", "both") for row in rows])
+    stance_foot_xy = np.vstack(
+        [np.asarray(row.get("stance_foot_xy", [0.0, 0.0]), dtype=float).reshape(2) for row in rows]
+    )
+    support_gap = np.array([float(row.get("support_distance", 0.0)) for row in rows])
     np.savez(
         path,
         time=time_s,
@@ -286,11 +586,16 @@ def save_log(path: Path, rows: list[dict]) -> None:
         intervention=intervention,
         cbf_status=status,
         ankle_xy=ankle_xy,
+        walk_state=walk_state,
+        support_foot=support_foot,
+        stance_foot_xy=stance_foot_xy,
+        support_distance=support_gap,
     )
     csv_path = path.with_suffix(".csv")
     header = (
         "time,com_x,com_y,com_z,ref_x,ref_y,ref_z,err_x,err_y,err_z,"
-        "com_vx,com_vy,com_vz,intervention,cbf_status"
+        "com_vx,com_vy,com_vz,intervention,cbf_status,walk_state,support_foot,"
+        "stance_x,stance_y,support_distance"
     )
     lines = [header]
     for i in range(time_s.size):
@@ -299,7 +604,8 @@ def save_log(path: Path, rows: list[dict]) -> None:
             f"{com_reference[i, 0]:.6f},{com_reference[i, 1]:.6f},{com_reference[i, 2]:.6f},"
             f"{com_error[i, 0]:.6f},{com_error[i, 1]:.6f},{com_error[i, 2]:.6f},"
             f"{com_velocity[i, 0]:.6f},{com_velocity[i, 1]:.6f},{com_velocity[i, 2]:.6f},"
-            f"{intervention[i]:.6f},{status[i]}"
+            f"{intervention[i]:.6f},{status[i]},{walk_state[i]},{support_foot[i]},"
+            f"{stance_foot_xy[i, 0]:.6f},{stance_foot_xy[i, 1]:.6f},{support_gap[i]:.6f}"
         )
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -314,28 +620,37 @@ def run_demo(args: argparse.Namespace) -> Path:
     fixed_reference = stand_reference(env, state0)
     torso = np.asarray(state0["torso_rotation"], dtype=float).copy()
     height = float(state0["com"][2])
-    heel, toe, _mid = foot_support_x(env)
-    margin = float(cbf.config.margin)
-    # The barrier box has to cover the sole. The default box is centred on the
-    # home CoM, which sits on the heels, so a forward weight shift would be
-    # rejected immediately.
+    gait: WalkingStateMachine | None = None
+    ik: LegIK | None = None
     if args.walk:
-        # Start the ramp on the centre of mass, not on the middle of the sole.
-        # A target that is already 6 cm ahead saturates the ankles and the
-        # robot falls backward. Stop 2 cm short of the toe: both feet stay
-        # down, so the weight cannot be shifted past the end of the sole.
-        origin_xy = np.asarray(state0["com"][:2], dtype=float).copy()
-        x_max = toe - 0.02
-        x_min = float(origin_xy[0])
-        x_limits = (x_min, x_max)
-        rear = float(origin_xy[0]) - 0.04
-        box_center = 0.5 * (rear + x_max)
-        half_x = 0.5 * (x_max - rear) + margin
-        cbf.config.support_center = (box_center, float(origin_xy[1]))
-        cbf.config.support_half_extents = (half_x, cbf.config.support_half_extents[1])
-    else:
-        x_limits = (heel, toe)
-        origin_xy = sole_center_xy(env)
+        # The shift is slower than the swing so the centre of mass is over
+        # the stance sole before the other foot leaves the ground.
+        gait = WalkingStateMachine(
+            WalkConfig(
+                step_length=0.1,
+                step_height=0.05,
+                step_duration=0.8,
+                shift_duration=1.5,
+                double_support_duration=0.4,
+                stand_duration=1.5,
+            )
+        )
+        ik = LegIK(env.model)
+        left_ankle, _left_rot = _ankle_pose(env, "left")
+        right_ankle, _right_rot = _ankle_pose(env, "right")
+        gait.start(
+            left_ankle,
+            right_ankle,
+            height,
+            n_steps=int(args.steps),
+            t0=0.0,
+            first_swing="right",
+        )
+        # The home centre of mass sits a couple of centimetres ahead of the
+        # heels. The standing margin of 2 cm would put that point on the
+        # rear face and the filter would throw the robot over.
+        cbf.config.margin = 0.0
+        cbf.set_support_polygon(support_polygon(env, ("left", "right")))
     log_path = Path(args.log_path)
     rows: list[dict] = []
     pushed = False
@@ -343,11 +658,9 @@ def run_demo(args: argparse.Namespace) -> Path:
 
     if args.walk:
         LOG.info(
-            "viewer open — close the window to stop. Walking at %.2f m/s, both feet planted. "
-            "CoM reference x from %.3f m to %.3f m.",
-            float(args.walk_speed),
-            x_limits[0],
-            x_limits[1],
+            "viewer open — close the window to stop. %d forward steps, "
+            "centre of mass shifts onto the stance foot before each swing.",
+            int(args.steps),
         )
     else:
         LOG.info(
@@ -365,17 +678,8 @@ def run_demo(args: argparse.Namespace) -> Path:
             sim_time = float(env.data.time)
 
             if args.walk:
-                reference = walking_reference(
-                    env,
-                    torso,
-                    origin_xy,
-                    height,
-                    float(args.walk_speed),
-                    sim_time,
-                    mpc.config.horizon,
-                    mpc.config.dt,
-                    x_limits,
-                )
+                assert gait is not None and ik is not None
+                row = walk_tick(env, mpc, cbf, pd, gait, ik, torso, rows)
             else:
                 reference = fixed_reference
                 if not pushed and sim_time >= PUSH_TIME:
@@ -388,8 +692,7 @@ def run_demo(args: argparse.Namespace) -> Path:
                         PUSH_DURATION,
                         body,
                     )
-
-            row = control_step(env, mpc, cbf, pd, reference)
+                row = control_step(env, mpc, cbf, pd, reference)
             rows.append(row)
             viewer.sync()
 
@@ -398,13 +701,20 @@ def run_demo(args: argparse.Namespace) -> Path:
                 vel = row["com_velocity"]
                 err = row["com_error"]
                 LOG.info(
-                    "t = %5.2f s | COM [%.3f %.3f %.3f] m | ref x %.3f m | "
+                    "t = %5.2f s | %s support %s | COM [%.3f %.3f %.3f] m | "
+                    "ref [%.3f %.3f] m | stance [%.3f %.3f] m | dist %.3f m | "
                     "error [%.3f %.3f %.3f] m | |v| = %.3f m/s | intervention %.2f Nm (%s)",
                     row["time"],
+                    row["walk_state"],
+                    row["support_foot"],
                     com[0],
                     com[1],
                     com[2],
                     row["com_reference"][0],
+                    row["com_reference"][1],
+                    float(np.asarray(row.get("stance_foot_xy", [0.0, 0.0]))[0]),
+                    float(np.asarray(row.get("stance_foot_xy", [0.0, 0.0]))[1]),
+                    float(row.get("support_distance", 0.0)),
                     err[0],
                     err[1],
                     err[2],
@@ -444,13 +754,19 @@ def parse_args() -> argparse.Namespace:
         "--walk",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="move the CoM reference forward at --walk-speed with both feet planted",
+        help="take alternating forward steps; --no-walk stands and takes the push",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=4,
+        help="number of swing steps in walking mode",
     )
     parser.add_argument(
         "--walk-speed",
         type=float,
         default=WALK_SPEED,
-        help="forward CoM reference speed in m/s (walking mode)",
+        help="forward CoM reference speed in m/s (unused by the stepping gait)",
     )
     parser.add_argument(
         "--push-force",
