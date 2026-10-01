@@ -36,6 +36,7 @@ from controllers.pd_controller import PDController
 from controllers.walk_state_machine import WalkConfig, WalkingStateMachine, WalkState
 from env.industrial_humanoid_env import EnvConfig, IndustrialHumanoidEnv
 from safety.cbf_filter import CBFConfig, CBFFilter
+from swing_diagnostic import save_support_plot, summarize_single_support
 from utils.logger import get_console_logger
 
 LOG = get_console_logger("main_demo")
@@ -452,6 +453,8 @@ def walk_tick(
     ik: LegIK,
     torso: np.ndarray,
     rows: list[dict],
+    swing_ramp: float = 0.03,
+    freeze_swing: bool = False,
 ) -> dict:
     """One stepping tick: shift, swing, polygon update, then MPC-PD-CBF."""
     loaded = gait.loaded_foot
@@ -496,7 +499,16 @@ def walk_tick(
     # become the new posture so the MPC does not pull the foot back home.
     previous_swing = str(rows[-1]["swing_side"]) if rows else ""
     if swing is None and previous_swing:
-        _hold_landed_leg(mpc, pose, previous_swing)
+        held = getattr(gait, "_swing_command", {})
+        # Land on the joints the swing actually reached. The raw inverse-
+        # kinematics target can still be ahead of the ramp, and snapping to
+        # it at touchdown is a torque step.
+        landed_pose = dict(pose)
+        for name, angle in held.items():
+            if name.startswith(f"{previous_swing}_"):
+                landed_pose[name] = float(angle)
+        _hold_landed_leg(mpc, landed_pose, previous_swing)
+        gait._landed_side = previous_swing
     # The state machine already names the stance ankle. That y coordinate is
     # thrown away by a midline reference, which is why the old shift stopped
     # at a few centimetres. Track the centre of the measured sole instead.
@@ -516,24 +528,36 @@ def walk_tick(
         com[:, 0] = ref_xy[0]
         com[:, 1] = ref_xy[1]
         reference["com"] = com
+        shift.skip_side = ""
         active_posture: LateralWeightShift | None = shift
         stance_sole = sole
         stance_xy = shift.target_xy.copy()
+    elif shift.solved and shift.side:
+        # The state machine's foot landmark is several centimetres off the
+        # body (about +3 cm in x and -3 cm in y on the first landing). That
+        # step saturates the MPC, and dropping the posture in the same tick
+        # removes the ankle pitch that was holding the rear support edge.
+        # Keep the clamped reference and the leaned stance leg. The landed
+        # leg stays on the touchdown pose written above.
+        sole = sole_corners(env, shift.side)
+        shift.skip_side = str(getattr(gait, "_landed_side", ""))
+        ref_xy = shift.advance(
+            mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
+        )
+        com[:, 0] = ref_xy[0]
+        com[:, 1] = ref_xy[1]
+        reference["com"] = com
+        active_posture = shift
+        both = support_polygon(env, ("left", "right"))
+        stance_sole = both
+        stance_xy = shift.target_xy.copy()
     else:
-        # The shift is no longer writing joint targets. Leave the leaned
-        # pose as the new home, or the hips snap back to the original stand
-        # and the body falls off the foot it just stepped from.
-        if shift.solved and shift.fraction > 0.0 and not getattr(shift, "baked", False):
-            # The leg that just landed already has its home pose set to the
-            # touchdown. Baking the shift over it pulls that foot back.
-            _bake_shift_pose(mpc, shift, skip_side=previous_swing)
-            shift.baked = True
         active_posture = None
         both = support_polygon(env, ("left", "right"))
         stance_sole = both
         stance_xy = both.mean(axis=0)
     swing_pose = None
-    if swing is not None:
+    if swing is not None and not freeze_swing:
         # Only the swinging leg leaves the shift posture. Replacing the
         # stance hip roll with the home angle drops the centre of mass off
         # the sole in one tick. The swing target is approached over the step,
@@ -545,11 +569,12 @@ def walk_tick(
         }
         held = getattr(gait, "_swing_command", {})
         swing_pose = {}
+        ramp = abs(float(swing_ramp))
         for name, angle in pose.items():
             if not name.startswith(f"{swing}_"):
                 continue
             previous = float(held.get(name, measured.get(name, angle)))
-            swing_pose[name] = previous + float(np.clip(float(angle) - previous, -0.03, 0.03))
+            swing_pose[name] = previous + float(np.clip(float(angle) - previous, -ramp, ramp))
         gait._swing_command = dict(swing_pose)
     else:
         gait._swing_command = {}
@@ -577,11 +602,41 @@ def walk_tick(
     else:
         row["com_acceleration"] = np.zeros(3)
     names = list(mpc._joint_names)
+    home = np.asarray(mpc._home_joint_qpos, dtype=float)
     for side in ("left", "right"):
-        index = names.index(f"{side}_hip_roll")
-        row[f"{side}_hip_roll_des"] = float(row["q_des"][index])
-        row[f"{side}_hip_roll"] = float(row["joint_qpos"][index])
-        row[f"{side}_hip_roll_torque"] = float(row["tau_safe"][index])
+        for joint in ("hip_roll", "hip_pitch", "knee", "ankle"):
+            index = names.index(f"{side}_{joint}")
+            row[f"{side}_{joint}_des"] = float(row["q_des"][index])
+            row[f"{side}_{joint}"] = float(row["joint_qpos"][index])
+            row[f"{side}_{joint}_torque"] = float(row["tau_safe"][index])
+            row[f"{side}_{joint}_nominal"] = float(row["tau_nominal"][index])
+        row[f"{side}_knee_vel"] = float(row["joint_qvel"][names.index(f"{side}_knee")])
+    stance_side = stance[0] if stance else ""
+    if stance_side:
+        ankle = names.index(f"{stance_side}_ankle")
+        row["stance_ankle_correction"] = float(row["q_des"][ankle] - home[ankle])
+    else:
+        row["stance_ankle_correction"] = 0.0
+    row["shift_target_xy"] = np.asarray(shift.target_xy, dtype=float).reshape(2).copy()
+    com_now = np.asarray(row["com"], dtype=float).reshape(3)
+    vel_now = np.asarray(row["com_velocity"], dtype=float).reshape(3)
+    omega = float(np.sqrt(9.81 / max(float(com_now[2]), 0.2)))
+    capture = com_now[:2] + vel_now[:2] / omega
+    row["capture_xy"] = capture
+    ref_xy = np.asarray(row["com_reference"][:2], dtype=float)
+    row["capture_error"] = capture - ref_xy
+    barriers = row.get("barriers") or {}
+    for name in ("support_x_lower", "support_x_upper", "support_y_lower", "support_y_upper"):
+        margin = float(barriers.get(name, np.nan))
+        row[name] = margin
+        axis = 0 if "x_" in name else 1
+        # A lower-face margin is com - edge, so the capture margin is that
+        # plus how far the capture point sits ahead of the centre of mass.
+        sign = 1.0 if name.endswith("lower") else -1.0
+        short = name.removeprefix("support_")
+        row[f"capture_margin_{short}"] = margin + sign * float(capture[axis] - com_now[axis])
+    rotation = np.asarray(row["base_rotation"], dtype=float).reshape(3, 3)
+    row["pelvis_pitch"] = float(np.arctan2(-rotation[2, 0], np.hypot(rotation[2, 1], rotation[2, 2])))
     return row
 
 
@@ -685,6 +740,30 @@ def save_log(path: Path, rows: list[dict]) -> None:
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _finish_log(args: argparse.Namespace, env: IndustrialHumanoidEnv, log_path: Path, rows: list[dict]) -> None:
+    """Write the demo log, and a swing summary when this run was walking."""
+    try:
+        if not rows:
+            return
+        save_log(log_path, rows)
+        interventions = np.array([row["intervention"] for row in rows])
+        LOG.info(
+            "closed after %.2f s, %d steps. peak intervention %.2f Nm. log: %s",
+            rows[-1]["time"],
+            len(rows),
+            float(interventions.max()),
+            log_path,
+        )
+        if args.walk:
+            report = summarize_single_support(rows)
+            print(report)
+            plot_path = log_path.with_name(log_path.stem + "_support.png")
+            save_support_plot(rows, plot_path)
+            LOG.info("support plot: %s", plot_path)
+    finally:
+        env.close()
+
+
 def run_demo(args: argparse.Namespace) -> Path:
     """Open the MuJoCo viewer and run until the user closes it."""
     import mujoco.viewer
@@ -702,9 +781,9 @@ def run_demo(args: argparse.Namespace) -> Path:
         # the stance sole before the other foot leaves the ground.
         gait = WalkingStateMachine(
             WalkConfig(
-                step_length=0.1,
+                step_length=float(getattr(args, "step_length", 0.1)),
                 step_height=0.05,
-                step_duration=0.8,
+                step_duration=float(getattr(args, "step_duration", 0.8)),
                 shift_duration=1.5,
                 double_support_duration=0.4,
                 stand_duration=1.5,
@@ -733,16 +812,59 @@ def run_demo(args: argparse.Namespace) -> Path:
 
     if args.walk:
         LOG.info(
-            "viewer open — close the window to stop. %d forward steps, "
-            "centre of mass shifts onto the stance foot before each swing.",
+            "%s %d forward steps, centre of mass shifts onto the stance foot before each swing.",
+            "headless run." if getattr(args, "headless", False) else "viewer open — close the window to stop.",
             int(args.steps),
         )
     else:
         LOG.info(
-            "viewer open — close the window to stop. Push of %.0f N at t = %.1f s.",
+            "%s Push of %.0f N at t = %.1f s.",
+            "headless run." if getattr(args, "headless", False) else "viewer open — close the window to stop.",
             float(np.linalg.norm(args.push_force)),
             PUSH_TIME,
         )
+
+    def one_tick(sim_time: float) -> dict:
+        nonlocal pushed
+        if args.walk:
+            assert gait is not None and ik is not None
+            return walk_tick(
+                env,
+                mpc,
+                cbf,
+                pd,
+                gait,
+                ik,
+                torso,
+                rows,
+                swing_ramp=float(getattr(args, "swing_ramp", 0.03)),
+                freeze_swing=bool(getattr(args, "freeze_swing", False)),
+            )
+        reference = fixed_reference
+        if not pushed and sim_time >= PUSH_TIME:
+            body = apply_push(env, np.asarray(args.push_force, dtype=float))
+            pushed = True
+            LOG.info(
+                "t = %.2f s: applied %s N for %.2f s on %s",
+                sim_time,
+                np.array2string(np.asarray(args.push_force), precision=0),
+                PUSH_DURATION,
+                body,
+            )
+        return control_step(env, mpc, cbf, pd, reference)
+
+    if bool(getattr(args, "headless", False)):
+        duration = float(getattr(args, "duration", 24.0))
+        try:
+            while float(env.data.time) < duration:
+                row = one_tick(float(env.data.time))
+                rows.append(row)
+                if float(row["com"][2]) < 0.72:
+                    LOG.info("stopped: pelvis height %.3f m", float(row["com"][2]))
+                    break
+        finally:
+            _finish_log(args, env, log_path, rows)
+        return log_path
 
     # launch_passive returns immediately. The loop below is what keeps the
     # window alive; is_running() goes false when the user closes it.
@@ -751,23 +873,7 @@ def run_demo(args: argparse.Namespace) -> Path:
         while viewer.is_running():
             tick = time.perf_counter()
             sim_time = float(env.data.time)
-
-            if args.walk:
-                assert gait is not None and ik is not None
-                row = walk_tick(env, mpc, cbf, pd, gait, ik, torso, rows)
-            else:
-                reference = fixed_reference
-                if not pushed and sim_time >= PUSH_TIME:
-                    body = apply_push(env, np.asarray(args.push_force, dtype=float))
-                    pushed = True
-                    LOG.info(
-                        "t = %.2f s: applied %s N for %.2f s on %s",
-                        sim_time,
-                        np.array2string(np.asarray(args.push_force), precision=0),
-                        PUSH_DURATION,
-                        body,
-                    )
-                row = control_step(env, mpc, cbf, pd, reference)
+            row = one_tick(sim_time)
             rows.append(row)
             viewer.sync()
 
@@ -805,17 +911,7 @@ def run_demo(args: argparse.Namespace) -> Path:
                 time.sleep(remaining)
     finally:
         viewer.close()
-        if rows:
-            save_log(log_path, rows)
-            interventions = np.array([row["intervention"] for row in rows])
-            LOG.info(
-                "closed after %.2f s, %d steps. peak intervention %.2f Nm. log: %s",
-                rows[-1]["time"],
-                len(rows),
-                float(interventions.max()),
-                log_path,
-            )
-        env.close()
+        _finish_log(args, env, log_path, rows)
     return log_path
 
 
@@ -862,6 +958,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=root / "data" / "demo_log.npz",
         help="where COM and intervention traces are written",
+    )
+    parser.add_argument("--step-length", type=float, default=0.1, help="forward step length in metres")
+    parser.add_argument("--step-duration", type=float, default=0.8, help="swing duration in seconds")
+    parser.add_argument(
+        "--swing-ramp",
+        type=float,
+        default=0.03,
+        help="maximum swing-joint target change per control tick, in radians",
+    )
+    parser.add_argument(
+        "--freeze-swing",
+        action="store_true",
+        help="enter single support but do not move the swing leg (diagnostic only)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="run without the viewer, for a fixed --duration, then print the swing diagnostic",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=24.0,
+        help="simulated seconds when --headless is set",
     )
     return parser.parse_args()
 

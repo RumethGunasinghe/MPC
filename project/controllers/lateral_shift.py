@@ -57,6 +57,9 @@ class LateralWeightShift:
         self.limit = "idle"
         self._on_sole = False
         self._com = np.zeros(3)
+        # Leg left on its landed pose. apply() must not pull it back to the
+        # pre-swing shift solution.
+        self.skip_side = ""
 
     def begin(
         self,
@@ -78,6 +81,7 @@ class LateralWeightShift:
         corners = np.asarray(sole_corners, dtype=float).reshape(-1, 2)
         self.side = side
         self.fraction = 0.0
+        self.skip_side = ""
         self._on_sole = False
         self.origin_xy = np.asarray(com[:2], dtype=float).copy()
         self.target_xy = corners.mean(axis=0)
@@ -199,17 +203,27 @@ class LateralWeightShift:
         home = np.asarray(home, dtype=float)
         index = {name: i for i, name in enumerate(joint_names)}
         fraction = float(self.fraction)
+        skip = self.skip_side
         for name, goal in self.pose.items():
             i = index.get(name)
             if i is None:
                 continue
             blended = (1.0 - fraction) * float(home[i]) + fraction * float(goal)
+            if skip and name.startswith(f"{skip}_"):
+                # Pitch, knee and ankle stay on the touchdown pose. Hip roll
+                # stays on the lean: releasing it in one tick rolls the pelvis
+                # off the stance sole.
+                if "hip_roll" in name:
+                    q_des[i] = blended
+                continue
             if "hip_roll" in name:
                 q_des[i] = blended
             else:
                 residual = float(np.clip(q_des[i] - home[i], -0.10, 0.10))
                 q_des[i] = blended + residual
         for side in ("left", "right"):
+            if side == skip:
+                continue
             hip = index.get(f"{side}_hip_pitch")
             knee = index.get(f"{side}_knee")
             ankle = index.get(f"{side}_ankle")
