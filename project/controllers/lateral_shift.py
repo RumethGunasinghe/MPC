@@ -12,9 +12,9 @@ This module does not hard-code that separation. It reads the ankle positions,
 puts the centre-of-mass target at the centre of the measured stance sole, and
 solves the leg posture that reaches that target with both ankles kept at the
 positions they have now. The posture is a blend from the home pose. The blend
-advances only while the capture point is still inside the sole, so the lean
-does not run off the foot. The swing is still someone else's decision: this
-class never reports that the foot may lift.
+slows down once the body is already moving onto the sole, and it is held once
+the centre of mass is inside and slow. The swing is still someone else's
+decision: this class never reports that the foot may lift.
 """
 
 from __future__ import annotations
@@ -50,10 +50,13 @@ class LateralWeightShift:
         self.sole_low = np.zeros(2)
         self.sole_high = np.zeros(2)
         self.pose: dict[str, float] = {}
+        self.pelvis_rpy = np.zeros(3)
         self.solved = False
         self.solve_info: dict[str, float] = {}
         # Why the blend did not advance on the last call. "moving" means it did.
         self.limit = "idle"
+        self._on_sole = False
+        self._com = np.zeros(3)
 
     def begin(
         self,
@@ -75,11 +78,12 @@ class LateralWeightShift:
         corners = np.asarray(sole_corners, dtype=float).reshape(-1, 2)
         self.side = side
         self.fraction = 0.0
+        self._on_sole = False
         self.origin_xy = np.asarray(com[:2], dtype=float).copy()
         self.target_xy = corners.mean(axis=0)
         self.sole_low = corners.min(axis=0)
         self.sole_high = corners.max(axis=0)
-        self.pose, self.solved, self.solve_info = _shift_posture(
+        self.pose, self.pelvis_rpy, self.solved, self.solve_info = _shift_posture(
             self.model,
             np.asarray(left_ankle, dtype=float).reshape(3),
             np.asarray(right_ankle, dtype=float).reshape(3),
@@ -87,45 +91,91 @@ class LateralWeightShift:
             home,
         )
 
-    def advance(self, dt: float, com: np.ndarray, com_velocity: np.ndarray) -> np.ndarray:
+    def advance(
+        self,
+        dt: float,
+        com: np.ndarray,
+        com_velocity: np.ndarray,
+        sole_corners: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Step the blend and return the centre-of-mass xy reference.
 
-        The reference is the straight line from the double-support centre of
-        mass to the stance-sole centre. The fraction along that line grows
-        only while the capture point is still inside the sole. Past the outer
-        edge the fraction decreases, which brings the centre of pressure back
-        before the body can fall off the capsule.
+        The blend is a slow lean toward the measured sole. Near the sole the
+        inverted pendulum runs away if that lean keeps growing: the centre of
+        mass gets ahead of the reference, and the MPC then saturates its
+        lateral acceleration at -5 m/s^2. Hip roll is owned by this posture,
+        so that saturated command never reaches the joint and the body keeps
+        accelerating. The lean therefore stops, and then eases off, once the
+        capture point is near the sole or the lateral speed is already a few
+        centimetres per second. The reference stays within 8 mm of the body
+        so the acceleration command remains inside its box.
         """
         if self.side is None:
             return np.asarray(com[:2], dtype=float).copy()
         com = np.asarray(com, dtype=float).reshape(-1)
         vel = np.asarray(com_velocity, dtype=float).reshape(-1)
+        if sole_corners is not None:
+            corners = np.asarray(sole_corners, dtype=float).reshape(-1, 2)
+            self.sole_low = corners.min(axis=0)
+            self.sole_high = corners.max(axis=0)
         omega = float(np.sqrt(9.81 / max(float(com[2]), 0.2)))
         capture_y = float(com[1] + vel[1] / omega)
+        sign = 1.0 if self.side == "left" else -1.0
+        # Stop just inside the live sole. Chasing the sole centre rolls the
+        # capsule, and the contact creeps further out.
         if self.side == "left":
-            outside = capture_y > float(self.sole_high[1]) - 0.015
-            short = float(com[1]) < float(self.target_xy[1]) - 0.005
+            hold_y = min(float(self.sole_low[1]) + 0.015, float(self.target_xy[1]))
+            gap = float(self.sole_low[1] - com[1])
+            capture_in = float(self.sole_low[1]) <= capture_y <= float(self.sole_high[1])
+            short = capture_y < hold_y - 0.005
         else:
-            outside = capture_y < float(self.sole_low[1]) + 0.015
-            short = float(com[1]) > float(self.target_xy[1]) + 0.005
-        if outside:
-            self.limit = "capture_outside_sole"
-            self.fraction = max(0.0, self.fraction - 2.0 * float(dt))
-        elif float(com[2]) < 0.86:
+            hold_y = max(float(self.sole_high[1]) - 0.015, float(self.target_xy[1]))
+            gap = float(com[1] - self.sole_high[1])
+            capture_in = float(self.sole_low[1]) <= capture_y <= float(self.sole_high[1])
+            short = capture_y > hold_y + 0.005
+        inside = bool(
+            self.sole_low[0] <= com[0] <= self.sole_high[0]
+            and self.sole_low[1] <= com[1] <= self.sole_high[1]
+        )
+        toward = float(vel[1]) * sign
+        close = gap < 0.05
+        braking = (close and toward > 0.02) or capture_in or toward > 0.04
+        if inside and abs(toward) < 0.03:
+            # Latched only after a slow arrival. A fly-through used to set
+            # this while still moving, and holding that lean threw the swing.
+            self._on_sole = True
+        if not self.solved:
+            self.limit = "posture_unsolved"
+            self.fraction = 0.0
+        elif float(com[2]) < 0.80 and not inside:
             self.limit = "height"
             self.fraction = max(0.0, self.fraction - 2.0 * float(dt))
-        elif not self.solved:
-            self.limit = "posture_unsolved"
-        elif not short:
-            self.limit = "com_at_target"
-        elif abs(float(vel[1])) >= 0.04:
-            self.limit = "lateral_speed"
-        elif self.fraction >= 1.0:
-            self.limit = "fraction"
-        else:
+        elif self._on_sole:
+            self.limit = "com_inside"
+        elif braking and toward > 0.015:
+            self.limit = "lateral_brake"
+            self.fraction = max(0.0, self.fraction - 0.20 * float(dt))
+        elif short and self.fraction < 1.0:
             self.limit = "moving"
-            self.fraction = min(1.0, self.fraction + 0.06 * float(dt))
-        return (1.0 - self.fraction) * self.origin_xy + self.fraction * self.target_xy
+            self.fraction = min(1.0, self.fraction + 0.05 * float(dt))
+        else:
+            self.limit = "capture_at_target"
+        reference = (1.0 - self.fraction) * self.origin_xy + self.fraction * self.target_xy
+        if self.side == "left":
+            reference[1] = min(float(reference[1]), hold_y)
+        else:
+            reference[1] = max(float(reference[1]), hold_y)
+        # Keep the lateral error under a centimetre. A larger lag saturates
+        # the MPC acceleration, and the posture has already replaced the hip
+        # roll that acceleration would have used.
+        if not self._on_sole and braking and toward > 0.015:
+            reference[1] = float(com[1]) - 0.008 * sign
+        reference[1] = float(np.clip(reference[1], float(com[1]) - 0.008, float(com[1]) + 0.008))
+        # Sagittal reference stays at the double-support position. Pulling it
+        # toward the sole centre walks the body onto the toes.
+        reference[0] = float(np.clip(self.origin_xy[0], float(com[0]) - 0.008, float(com[0]) + 0.008))
+        self._com = com.copy()
+        return reference
 
     def apply(
         self,
@@ -137,12 +187,11 @@ class LateralWeightShift:
     ) -> np.ndarray:
         """Leg targets for the current blend, with the MPC's sagittal residual kept.
 
-        Hip roll follows the solved posture alone: the MPC's lateral capture
-        offset is the ±0.15 rad clip that stalled the old shift, and adding it
-        again would fight the posture. Hip pitch and knee keep a small piece
-        of the MPC command so the ankles can still balance fore-aft. Ankle
-        pitch is then set so the sole stays level, plus that same fore-aft
-        residual.
+        Hip roll follows the solved posture alone. The capture offset on that
+        joint is the ±0.15 rad clip that stalled the old shift, and adding it
+        also breaks the pelvis-roll pair that keeps the soles flat. Hip pitch
+        and knee keep a small piece of the MPC command so the ankles can still
+        balance fore-aft. Ankle pitch then levels the sole, plus that residual.
         """
         if not self.solved or self.side is None or self.fraction <= 0.0:
             return np.asarray(q_mpc, dtype=float).copy()
@@ -167,7 +216,14 @@ class LateralWeightShift:
             if hip is None or knee is None or ankle is None:
                 continue
             residual = float(np.clip(q_mpc[ankle] - home[ankle], -0.15, 0.15))
-            q_des[ankle] = -(q_des[hip] + q_des[knee]) + residual
+            # The knee blend pitches the pelvis back a few millimetres per
+            # second. The capture residual above is already at its global
+            # clip once that error exists, and it loses. Extra ankle pitch,
+            # proportional to how far the centre of mass has slid behind the
+            # double-support position, is what keeps the heel barrier open.
+            back = float(self.origin_xy[0] - self._com[0])
+            heel = float(np.clip(-4.0 * back, -0.2, 0.05))
+            q_des[ankle] = -(q_des[hip] + q_des[knee]) + residual + heel
         return np.clip(q_des, low, high)
 
 
@@ -188,14 +244,14 @@ def _shift_posture(
     right_ankle: np.ndarray,
     target_xy: np.ndarray,
     home: dict[str, float],
-) -> tuple[dict[str, float], bool, dict[str, float]]:
+) -> tuple[dict[str, float], np.ndarray, bool, dict[str, float]]:
     """Joint angles that put the centre of mass on ``target_xy`` with both feet planted.
 
     The floating base is free in the solve so the pelvis can move over the
     stance foot. The ankles are constrained to the measured positions, so the
-    solution is a weight shift, not a step. Returns ``(pose, accepted)``.
-    A solve that cannot keep the feet where they were is rejected and the
-    caller leaves the joints to the MPC.
+    solution is a weight shift, not a step. Returns the leg joints and the
+    pelvis roll, pitch and yaw of that pose. A solve that cannot keep the
+    feet where they were is rejected and the caller leaves the joints to the MPC.
     """
     import mujoco
 
@@ -263,4 +319,4 @@ def _shift_posture(
     right_error = float(np.linalg.norm(data.xpos[body_id("right_ankle_link")] - right_ankle))
     accepted = left_error < 0.02 and right_error < 0.02 and float(result.cost) < 0.05
     pose_error = {"left_ankle_m": left_error, "right_ankle_m": right_error, "cost": float(result.cost)}
-    return pose, accepted, pose_error
+    return pose, np.asarray(result.x[3:6], dtype=float).copy(), accepted, pose_error

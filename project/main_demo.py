@@ -223,8 +223,6 @@ def control_step(
             state["contact_jacobians"] = planted
     solution = mpc.solve(state, reference)
     q_des = solution["q_des"]
-    if joint_pose is not None:
-        q_des = _compose_step_joints(mpc, q_des, joint_pose, swing_side)
     if stance_hip_roll is not None:
         roll_side, roll_angle = stance_hip_roll
         for index, name in enumerate(mpc._joint_names):
@@ -233,9 +231,13 @@ def control_step(
     if posture is not None:
         # The shift posture replaces the leg targets. It is solved from the
         # measured feet; the MPC's fore-aft residual is kept inside apply().
+        # Applied before the swing inverse kinematics so the stance lean is
+        # held and only the leg that is in the air is overwritten.
         q_des = posture.apply(
             q_des, mpc._joint_names, mpc._home_joint_qpos, mpc._joint_low, mpc._joint_high
         )
+    if joint_pose is not None:
+        q_des = _compose_step_joints(mpc, q_des, joint_pose, swing_side)
     qd_des = solution["qd_des"]
 
     # One CBF solve per control tick. The modification ``delta`` is held across
@@ -335,8 +337,6 @@ def _compose_step_joints(
         if side == swing_side:
             if name in joint_pose:
                 q_des[index] = joint_pose[name]
-            elif "hip_roll" in name or "hip_yaw" in name:
-                q_des[index] = home[index]
             continue
         if name in joint_pose:
             correction = float(q_mpc[index] - home[index])
@@ -416,15 +416,31 @@ def build_step_command(
 
 
 def _com_over_foot(env: IndustrialHumanoidEnv, side: str) -> bool:
-    """True when the centre of mass is clearly inside one sole."""
+    """True when the centre of mass and its capture point are inside one sole.
+
+    Position alone is not enough. A centre of mass that is inside the sole
+    but still moving outward leaves the sole as soon as the other foot lifts.
+    The capture point ``c + v/omega`` has to be inside as well.
+    """
     sole = support_polygon(env, (side,))
-    com_xy = np.asarray(env.get_state()["com"][:2], dtype=float)
+    state = env.get_state()
+    com = np.asarray(state["com"], dtype=float).reshape(3)
+    vel = np.asarray(state["com_velocity"], dtype=float).reshape(3)
+    omega = float(np.sqrt(9.81 / max(float(com[2]), 0.2)))
+    capture = com[:2] + vel[:2] / omega
     low = sole.min(axis=0) + 0.01
     high = sole.max(axis=0) - 0.01
     if np.any(high <= low):
         low = sole.min(axis=0)
         high = sole.max(axis=0)
-    return bool(np.all(com_xy >= low) and np.all(com_xy <= high))
+
+    def _inside(point: np.ndarray) -> bool:
+        return bool(np.all(point >= low) and np.all(point <= high))
+
+    # A few centimetres per second is still a fly-through: the sole can
+    # contain the capture point only because the foot has rolled with the body.
+    slow = abs(float(vel[1])) < 0.03 and abs(float(vel[0])) < 0.08
+    return _inside(com[:2]) and _inside(capture) and slow
 
 
 def walk_tick(
@@ -487,14 +503,16 @@ def walk_tick(
     shift = _weight_shift(gait, env.model)
     state_now = env.get_state()
     loaded = gait.loaded_foot
-    if loaded is not None and swing is None:
+    if loaded is not None:
         sole = sole_corners(env, loaded)
         if shift.side != loaded:
             left_ankle, _left_rot = _ankle_pose(env, "left")
             right_ankle, _right_rot = _ankle_pose(env, "right")
             home = {name: float(q) for name, q in zip(mpc._joint_names, mpc._home_joint_qpos)}
             shift.begin(loaded, left_ankle, right_ankle, state_now["com"], sole, home)
-        ref_xy = shift.advance(mpc.config.dt, state_now["com"], state_now["com_velocity"])
+        ref_xy = shift.advance(
+            mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
+        )
         com[:, 0] = ref_xy[0]
         com[:, 1] = ref_xy[1]
         reference["com"] = com
@@ -502,10 +520,39 @@ def walk_tick(
         stance_sole = sole
         stance_xy = shift.target_xy.copy()
     else:
+        # The shift is no longer writing joint targets. Leave the leaned
+        # pose as the new home, or the hips snap back to the original stand
+        # and the body falls off the foot it just stepped from.
+        if shift.solved and shift.fraction > 0.0 and not getattr(shift, "baked", False):
+            # The leg that just landed already has its home pose set to the
+            # touchdown. Baking the shift over it pulls that foot back.
+            _bake_shift_pose(mpc, shift, skip_side=previous_swing)
+            shift.baked = True
         active_posture = None
         both = support_polygon(env, ("left", "right"))
         stance_sole = both
         stance_xy = both.mean(axis=0)
+    swing_pose = None
+    if swing is not None:
+        # Only the swinging leg leaves the shift posture. Replacing the
+        # stance hip roll with the home angle drops the centre of mass off
+        # the sole in one tick. The swing target is approached over the step,
+        # not applied in one tick: that step is about 100 N·m, outside the
+        # CBF trust region, so the filter fails safe and holds the
+        # double-support torque while the foot is supposed to unload.
+        measured = {
+            name: float(q) for name, q in zip(mpc._joint_names, state_now["joint_qpos"])
+        }
+        held = getattr(gait, "_swing_command", {})
+        swing_pose = {}
+        for name, angle in pose.items():
+            if not name.startswith(f"{swing}_"):
+                continue
+            previous = float(held.get(name, measured.get(name, angle)))
+            swing_pose[name] = previous + float(np.clip(float(angle) - previous, -0.03, 0.03))
+        gait._swing_command = dict(swing_pose)
+    else:
+        gait._swing_command = {}
     row = control_step(
         env,
         mpc,
@@ -513,7 +560,7 @@ def walk_tick(
         pd,
         reference,
         stance=stance,
-        joint_pose=pose if swing is not None else None,
+        joint_pose=swing_pose,
         swing_side=swing,
         walk_state=command.state.value,
         support_foot=command.support_foot,
@@ -524,6 +571,11 @@ def walk_tick(
     row["support_distance"] = support_distance(row["com"][:2], stance_sole)
     row["shift_fraction"] = float(shift.fraction)
     row["shift_limit"] = shift.limit
+    dt = float(mpc.config.dt)
+    if rows:
+        row["com_acceleration"] = (np.asarray(row["com_velocity"], dtype=float) - np.asarray(rows[-1]["com_velocity"], dtype=float)) / dt
+    else:
+        row["com_acceleration"] = np.zeros(3)
     names = list(mpc._joint_names)
     for side in ("left", "right"):
         index = names.index(f"{side}_hip_roll")
@@ -531,6 +583,29 @@ def walk_tick(
         row[f"{side}_hip_roll"] = float(row["joint_qpos"][index])
         row[f"{side}_hip_roll_torque"] = float(row["tau_safe"][index])
     return row
+
+
+def _bake_shift_pose(mpc: WholeBodyMPC, shift: LateralWeightShift, skip_side: str = "") -> None:
+    """Copy the current leaned leg pose into the MPC home pose."""
+    home = mpc._home_joint_qpos
+    index = {name: i for i, name in enumerate(mpc._joint_names)}
+    fraction = float(shift.fraction)
+    for name, goal in shift.pose.items():
+        if skip_side and name.startswith(f"{skip_side}_"):
+            continue
+        i = index.get(name)
+        if i is None:
+            continue
+        home[i] = (1.0 - fraction) * float(home[i]) + fraction * float(goal)
+    for side in ("left", "right"):
+        if side == skip_side:
+            continue
+        hip = index.get(f"{side}_hip_pitch")
+        knee = index.get(f"{side}_knee")
+        ankle = index.get(f"{side}_ankle")
+        if hip is None or knee is None or ankle is None:
+            continue
+        home[ankle] = -(float(home[hip]) + float(home[knee]))
 
 
 def _weight_shift(gait: WalkingStateMachine, model) -> LateralWeightShift:
