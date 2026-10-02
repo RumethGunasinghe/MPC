@@ -60,6 +60,15 @@ class LateralWeightShift:
         # Leg left on its landed pose. apply() must not pull it back to the
         # pre-swing shift solution.
         self.skip_side = ""
+        # Late-swing trim. The walking tick turns this on only for a swing,
+        # and advance() uses it only while the capture point is closing on
+        # the outer sole edge.
+        self.capture_trim = False
+        self._trim_anchor: float | None = None
+        # Touchdown reference. Held so the 8 mm clamp cannot chase the body
+        # off the sole after the swing.
+        self.handoff_xy: np.ndarray | None = None
+        self.hold_landed = False
 
     def begin(
         self,
@@ -82,6 +91,9 @@ class LateralWeightShift:
         self.side = side
         self.fraction = 0.0
         self.skip_side = ""
+        self._trim_anchor = None
+        self.handoff_xy = None
+        self.hold_landed = False
         self._on_sole = False
         self.origin_xy = np.asarray(com[:2], dtype=float).copy()
         self.target_xy = corners.mean(axis=0)
@@ -156,6 +168,27 @@ class LateralWeightShift:
             self.fraction = max(0.0, self.fraction - 2.0 * float(dt))
         elif self._on_sole:
             self.limit = "com_inside"
+            # The lean is latched for the swing. It is eased only while the
+            # capture point is still inside and closing on the outer edge,
+            # and only by a few hundredths of the blend. Unwinding the same
+            # hip roll after touchdown did not pull the body back.
+            if (
+                self.capture_trim
+                and not self.skip_side
+                and inside
+                and toward > 0.0
+            ):
+                outer = (
+                    float(self.sole_high[1]) - capture_y
+                    if self.side == "left"
+                    else capture_y - float(self.sole_low[1])
+                )
+                if outer < 0.05:
+                    if self._trim_anchor is None:
+                        self._trim_anchor = float(self.fraction)
+                    floor = max(0.0, float(self._trim_anchor) - 0.04)
+                    self.fraction = max(floor, self.fraction - 0.15 * float(dt))
+                    self.limit = "late_capture"
         elif braking and toward > 0.015:
             self.limit = "lateral_brake"
             self.fraction = max(0.0, self.fraction - 0.20 * float(dt))
@@ -210,11 +243,14 @@ class LateralWeightShift:
                 continue
             blended = (1.0 - fraction) * float(home[i]) + fraction * float(goal)
             if skip and name.startswith(f"{skip}_"):
-                # Pitch, knee and ankle stay on the touchdown pose. Hip roll
-                # stays on the lean: releasing it in one tick rolls the pelvis
-                # off the stance sole.
+                # Hip roll stays on the lean. Pitch and knee stay on the
+                # touchdown command written into home: q_mpc would add the
+                # capture offset on the landing tick, about 0.13 rad on the
+                # ankle in the baseline hand-off.
                 if "hip_roll" in name:
                     q_des[i] = blended
+                elif self.hold_landed:
+                    q_des[i] = float(home[i])
                 continue
             if "hip_roll" in name:
                 q_des[i] = blended
@@ -223,6 +259,10 @@ class LateralWeightShift:
                 q_des[i] = blended + residual
         for side in ("left", "right"):
             if side == skip:
+                if self.hold_landed:
+                    ankle = index.get(f"{side}_ankle")
+                    if ankle is not None:
+                        q_des[ankle] = float(home[ankle])
                 continue
             hip = index.get(f"{side}_hip_pitch")
             knee = index.get(f"{side}_knee")

@@ -455,6 +455,8 @@ def walk_tick(
     rows: list[dict],
     swing_ramp: float = 0.03,
     freeze_swing: bool = False,
+    late_swing_capture: bool = False,
+    landing_handoff: bool = False,
 ) -> dict:
     """One stepping tick: shift, swing, polygon update, then MPC-PD-CBF."""
     loaded = gait.loaded_foot
@@ -522,13 +524,17 @@ def walk_tick(
             right_ankle, _right_rot = _ankle_pose(env, "right")
             home = {name: float(q) for name, q in zip(mpc._joint_names, mpc._home_joint_qpos)}
             shift.begin(loaded, left_ankle, right_ankle, state_now["com"], sole, home)
+        shift.skip_side = ""
+        shift.hold_landed = False
+        # Armed only while a foot is in the air. advance() still ignores it
+        # until the capture point is inside 5 cm of the outer sole edge.
+        shift.capture_trim = bool(late_swing_capture) and swing is not None
         ref_xy = shift.advance(
             mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
         )
         com[:, 0] = ref_xy[0]
         com[:, 1] = ref_xy[1]
         reference["com"] = com
-        shift.skip_side = ""
         active_posture: LateralWeightShift | None = shift
         stance_sole = sole
         stance_xy = shift.target_xy.copy()
@@ -541,9 +547,36 @@ def walk_tick(
         # leg stays on the touchdown pose written above.
         sole = sole_corners(env, shift.side)
         shift.skip_side = str(getattr(gait, "_landed_side", ""))
-        ref_xy = shift.advance(
-            mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
-        )
+        shift.capture_trim = False
+        if landing_handoff:
+            # Keep the reference that was active at touchdown. Calling
+            # advance() again would clip it onto the outward-moving centre
+            # of mass, which is how the held lean walked off the sole.
+            # The landed pitch, knee and ankle stay on the command the swing
+            # actually reached; the capture offset is not added on top.
+            shift.hold_landed = True
+            if shift.handoff_xy is None:
+                ref_xy = shift.advance(
+                    mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
+                )
+                shift.handoff_xy = np.asarray(ref_xy, dtype=float).copy()
+            else:
+                shift._com = np.asarray(state_now["com"], dtype=float).copy()
+                ref_xy = np.asarray(shift.handoff_xy, dtype=float).copy()
+            speed = np.asarray(state_now["com_velocity"], dtype=float).reshape(-1)
+            if abs(float(speed[0])) < 0.02 and abs(float(speed[1])) < 0.02:
+                left_xy, _left_rot = _ankle_pose(env, "left")
+                right_xy, _right_rot = _ankle_pose(env, "right")
+                mid_y = 0.5 * (float(left_xy[1]) + float(right_xy[1]))
+                shift.handoff_xy[1] += float(
+                    np.clip(mid_y - float(shift.handoff_xy[1]), -0.002, 0.002)
+                )
+                ref_xy = np.asarray(shift.handoff_xy, dtype=float).copy()
+        else:
+            shift.hold_landed = False
+            ref_xy = shift.advance(
+                mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
+            )
         com[:, 0] = ref_xy[0]
         com[:, 1] = ref_xy[1]
         reference["com"] = com
@@ -596,6 +629,7 @@ def walk_tick(
     row["support_distance"] = support_distance(row["com"][:2], stance_sole)
     row["shift_fraction"] = float(shift.fraction)
     row["shift_limit"] = shift.limit
+    row["posture_active"] = bool(active_posture is not None)
     dt = float(mpc.config.dt)
     if rows:
         row["com_acceleration"] = (np.asarray(row["com_velocity"], dtype=float) - np.asarray(rows[-1]["com_velocity"], dtype=float)) / dt
@@ -611,7 +645,7 @@ def walk_tick(
             row[f"{side}_{joint}_torque"] = float(row["tau_safe"][index])
             row[f"{side}_{joint}_nominal"] = float(row["tau_nominal"][index])
         row[f"{side}_knee_vel"] = float(row["joint_qvel"][names.index(f"{side}_knee")])
-    stance_side = stance[0] if stance else ""
+    stance_side = stance[0] if stance else (shift.side or "")
     if stance_side:
         ankle = names.index(f"{stance_side}_ankle")
         row["stance_ankle_correction"] = float(row["q_des"][ankle] - home[ankle])
@@ -839,6 +873,8 @@ def run_demo(args: argparse.Namespace) -> Path:
                 rows,
                 swing_ramp=float(getattr(args, "swing_ramp", 0.03)),
                 freeze_swing=bool(getattr(args, "freeze_swing", False)),
+                late_swing_capture=bool(getattr(args, "late_swing_capture", False)),
+                landing_handoff=bool(getattr(args, "landing_handoff", False)),
             )
         reference = fixed_reference
         if not pushed and sim_time >= PUSH_TIME:
@@ -971,6 +1007,16 @@ def parse_args() -> argparse.Namespace:
         "--freeze-swing",
         action="store_true",
         help="enter single support but do not move the swing leg (diagnostic only)",
+    )
+    parser.add_argument(
+        "--late-swing-capture",
+        action="store_true",
+        help="ease the lean during swing only while the capture point closes on the outer sole edge",
+    )
+    parser.add_argument(
+        "--landing-handoff",
+        action="store_true",
+        help="hold the touchdown reference and landed-leg command through early double support",
     )
     parser.add_argument(
         "--headless",
