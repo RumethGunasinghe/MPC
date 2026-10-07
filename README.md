@@ -389,3 +389,4 @@ The printed report includes swing side and duration, the first rear-margin breac
 ## Current limit
 
 Standing, the 80 N push, the shift onto the left sole, and the right swing are in place. The failure that remains is after the right foot touches down: lateral speed grows while the measured sole is still reported under the centre of mass, and the robot falls off the outside of the left foot. Do not paper over that by widening torque limits, the acceleration box, the CBF trust region, or the support polygon. Multi-step walking waits until one step stands up again in double support.
+
