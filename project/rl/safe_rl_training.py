@@ -129,6 +129,68 @@ class ResidualGaussianPolicy(nn.Module if nn is not None else object):
         return torch.distributions.Normal(mean, std)
 
 
+def constrained_policy_update(
+    policy: ResidualGaussianPolicy,
+    optimizer,
+    lagrange: float,
+    batch: dict[str, np.ndarray],
+    *,
+    minibatch_size: int,
+    epochs: int,
+    clip_range: float,
+) -> dict[str, float]:
+    """Clipped PPO step on the Lagrangian advantage ``A_r - lambda A_c``.
+
+    The reward advantage is standardised. The cost advantage is not, so the
+    Lagrange multiplier keeps a meaningful scale. Shared by the standing
+    trainer and the touchdown trainer.
+    """
+    if torch is None or nn is None:  # pragma: no cover
+        raise ImportError("torch is required for the safe RL policy")
+    if batch["obs"].shape[0] == 0:
+        return {"policy_loss": 0.0, "lagrange": float(lagrange), "mean_reward": 0.0, "mean_cost": 0.0, "mean_intervention": 0.0}
+    obs = torch.as_tensor(batch["obs"], dtype=torch.float32)
+    actions = torch.as_tensor(batch["actions"], dtype=torch.float32)
+    old_log_probs = torch.as_tensor(batch["log_probs"], dtype=torch.float32)
+    reward_adv = torch.as_tensor(batch["reward_adv"], dtype=torch.float32)
+    reward_adv = (reward_adv - reward_adv.mean()) / (reward_adv.std() + 1e-8)
+    cost_adv = torch.as_tensor(batch["cost_adv"], dtype=torch.float32)
+    advantage = reward_adv - float(lagrange) * cost_adv
+    reward_return = torch.as_tensor(batch["reward_return"], dtype=torch.float32)
+    cost_return = torch.as_tensor(batch["cost_return"], dtype=torch.float32)
+
+    n = obs.shape[0]
+    batch_size = max(1, min(int(minibatch_size), n))
+    last_loss = 0.0
+    for _ in range(int(epochs)):
+        order = torch.randperm(n)
+        for start in range(0, n, batch_size):
+            index = order[start : start + batch_size]
+            mean, value, cost_value = policy(obs[index])
+            dist = policy.distribution(mean)
+            log_prob = dist.log_prob(actions[index]).sum(-1)
+            ratio = torch.exp(log_prob - old_log_probs[index])
+            unclipped = ratio * advantage[index]
+            clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantage[index]
+            policy_loss = -torch.min(unclipped, clipped).mean()
+            value_loss = 0.5 * (value - reward_return[index]).pow(2).mean()
+            cost_loss = 0.5 * (cost_value - cost_return[index]).pow(2).mean()
+            entropy = dist.entropy().sum(-1).mean()
+            loss = policy_loss + value_loss + cost_loss - 0.01 * entropy
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            last_loss = float(loss.detach())
+    return {
+        "policy_loss": last_loss,
+        "lagrange": float(lagrange),
+        "mean_reward": float(batch.get("mean_reward", 0.0)),
+        "mean_cost": float(batch.get("mean_cost", 0.0)),
+        "mean_intervention": float(batch.get("mean_intervention", 0.0)),
+    }
+
+
 class SafeRLTrainer:
     """Constrained policy optimisation against ``IndustrialHumanoidEnv``."""
 
@@ -287,51 +349,15 @@ class SafeRLTrainer:
 
     def update(self, batch: dict[str, np.ndarray]) -> dict[str, float]:
         """One constrained policy update; returns the metrics to log."""
-        if batch["obs"].shape[0] == 0:
-            return {"policy_loss": 0.0, "lagrange": self.lagrange.value}
-        cfg = self.config
-        obs = torch.as_tensor(batch["obs"], dtype=torch.float32)
-        actions = torch.as_tensor(batch["actions"], dtype=torch.float32)
-        old_log_probs = torch.as_tensor(batch["log_probs"], dtype=torch.float32)
-        # Lagrangian advantage. Standardise the reward part only; the cost
-        # advantage keeps its scale so lambda stays meaningful.
-        reward_adv = torch.as_tensor(batch["reward_adv"], dtype=torch.float32)
-        reward_adv = (reward_adv - reward_adv.mean()) / (reward_adv.std() + 1e-8)
-        cost_adv = torch.as_tensor(batch["cost_adv"], dtype=torch.float32)
-        advantage = reward_adv - self.lagrange.value * cost_adv
-        reward_return = torch.as_tensor(batch["reward_return"], dtype=torch.float32)
-        cost_return = torch.as_tensor(batch["cost_return"], dtype=torch.float32)
-
-        n = obs.shape[0]
-        batch_size = max(1, min(cfg.minibatch_size, n))
-        last_loss = 0.0
-        for _ in range(cfg.epochs_per_update):
-            order = torch.randperm(n)
-            for start in range(0, n, batch_size):
-                index = order[start : start + batch_size]
-                mean, value, cost_value = self.policy(obs[index])
-                dist = self.policy.distribution(mean)
-                log_prob = dist.log_prob(actions[index]).sum(-1)
-                ratio = torch.exp(log_prob - old_log_probs[index])
-                unclipped = ratio * advantage[index]
-                clipped = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range) * advantage[index]
-                policy_loss = -torch.min(unclipped, clipped).mean()
-                value_loss = 0.5 * (value - reward_return[index]).pow(2).mean()
-                cost_loss = 0.5 * (cost_value - cost_return[index]).pow(2).mean()
-                entropy = dist.entropy().sum(-1).mean()
-                loss = policy_loss + value_loss + cost_loss - 0.01 * entropy
-                self._optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-                self._optimizer.step()
-                last_loss = float(loss.detach())
-        return {
-            "policy_loss": last_loss,
-            "lagrange": self.lagrange.value,
-            "mean_reward": float(batch["mean_reward"]),
-            "mean_cost": float(batch["mean_cost"]),
-            "mean_intervention": float(batch["mean_intervention"]),
-        }
+        return constrained_policy_update(
+            self.policy,
+            self._optimizer,
+            self.lagrange.value,
+            batch,
+            minibatch_size=self.config.minibatch_size,
+            epochs=self.config.epochs_per_update,
+            clip_range=self.config.clip_range,
+        )
 
     def evaluate(self, episodes: int = 10) -> dict[str, float]:
         """Deterministic evaluation: return, cost, and violation rate."""

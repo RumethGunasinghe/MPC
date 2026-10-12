@@ -1,0 +1,26 @@
+{
+  "log": "C:\\Users\\rumet\\Desktop\\MPC new\\project\\data\\logs\\standing_push_latest.npz",
+  "push_force_n": [
+    80.0,
+    0.0,
+    0.0
+  ],
+  "push_window_s": [
+    2.0,
+    2.2
+  ],
+  "peak_pitch_rad": 0.2182793412168029,
+  "peak_pitch_deg": 12.506485006618801,
+  "peak_com_vx_m_s": 0.13639992019760566,
+  "peak_com_speed_m_s": 0.17720763406385112,
+  "max_com_x_displacement_m": 0.09836195647894061,
+  "min_com_x_displacement_m": 0.0,
+  "peak_cbf_intervention_nm": 120.26912150704132,
+  "final_com_m": [
+    0.0704751328038,
+    0.00037256543753263853,
+    0.9284789871102664
+  ],
+  "final_torso_pitch_rad": -0.00038143502954205176,
+  "final_robot_height_m": 0.9284789871102664
+}

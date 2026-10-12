@@ -37,6 +37,7 @@ from controllers.walk_state_machine import WalkConfig, WalkingStateMachine, Walk
 from env.industrial_humanoid_env import EnvConfig, IndustrialHumanoidEnv
 from safety.cbf_filter import CBFConfig, CBFFilter
 from swing_diagnostic import save_support_plot, summarize_single_support
+from utils.experiment_logger import write_experiment_log
 from utils.logger import get_console_logger
 
 LOG = get_console_logger("main_demo")
@@ -222,7 +223,9 @@ def control_step(
         if planted:
             state = dict(state)
             state["contact_jacobians"] = planted
+    solve_started = time.perf_counter()
     solution = mpc.solve(state, reference)
+    mpc_solve_s = float(time.perf_counter() - solve_started)
     q_des = solution["q_des"]
     if stance_hip_roll is not None:
         roll_side, roll_angle = stance_hip_roll
@@ -271,6 +274,9 @@ def control_step(
     if ref_com.ndim == 2:
         ref_com = ref_com[0]
     ref_com = ref_com.reshape(3)
+    torso_ref = reference.get("torso_orientation")
+    left_foot, left_vel = _body_pose_and_velocity(env, "left_ankle_link")
+    right_foot, right_vel = _body_pose_and_velocity(env, "right_ankle_link")
     return {
         "time": float(np.asarray(after["time"]).reshape(-1)[0]),
         "com": after["com"].copy(),
@@ -282,15 +288,51 @@ def control_step(
         "tau_nominal": tau_nominal.copy(),
         "tau_safe": tau_safe.copy(),
         "q_des": np.asarray(q_des, dtype=float).copy(),
+        "qd_des": np.asarray(qd_des, dtype=float).copy(),
+        "qpos": after["qpos"].copy(),
+        "qvel": after["qvel"].copy(),
         "joint_qpos": after["joint_qpos"].copy(),
         "joint_qvel": after["joint_qvel"].copy(),
         "base_rotation": after["base_rotation"].copy(),
+        "pelvis_rpy": _rpy(after["base_rotation"]),
+        "torso_rpy": _rpy(after["torso_rotation"]),
+        "torso_rpy_ref": _rpy(torso_ref) if torso_ref is not None else np.full(3, np.nan),
+        "left_foot_xyz": left_foot,
+        "right_foot_xyz": right_foot,
+        "left_foot_vel": left_vel,
+        "right_foot_vel": right_vel,
+        "mpc_solve_s": mpc_solve_s,
         "barriers": cbf.com_barrier_values(after["com"]),
         "ankle_xy": _ankle_positions(env),
         "walk_state": walk_state,
         "support_foot": support_foot,
         "com_acceleration_des": np.asarray(solution["com_acceleration"], dtype=float).copy(),
     }
+
+
+def _rpy(rotation: np.ndarray) -> np.ndarray:
+    """Roll, pitch and yaw in radians from a body-to-world rotation."""
+    matrix = np.asarray(rotation, dtype=float)
+    if matrix.ndim == 3:
+        matrix = matrix[0]
+    matrix = matrix.reshape(3, 3)
+    roll = float(np.arctan2(matrix[2, 1], matrix[2, 2]))
+    pitch = float(np.arctan2(-matrix[2, 0], np.hypot(matrix[2, 1], matrix[2, 2])))
+    yaw = float(np.arctan2(matrix[1, 0], matrix[0, 0]))
+    return np.array([roll, pitch, yaw], dtype=float)
+
+
+def _body_pose_and_velocity(env: IndustrialHumanoidEnv, body_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """World position and linear velocity of a body. Reads MuJoCo; writes nothing."""
+    import mujoco
+
+    body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if body_id < 0:
+        return np.full(3, np.nan), np.full(3, np.nan)
+    position = np.asarray(env.data.xpos[body_id], dtype=float).copy()
+    spatial = np.zeros(6)
+    mujoco.mj_objectVelocity(env.model, env.data, mujoco.mjtObj.mjOBJ_BODY, body_id, spatial, 0)
+    return position, np.asarray(spatial[3:], dtype=float).copy()
 
 
 def _ankle_positions(env: IndustrialHumanoidEnv) -> np.ndarray:
@@ -457,6 +499,7 @@ def walk_tick(
     freeze_swing: bool = False,
     late_swing_capture: bool = False,
     landing_handoff: bool = False,
+    touchdown_agent=None,
 ) -> dict:
     """One stepping tick: shift, swing, polygon update, then MPC-PD-CBF."""
     loaded = gait.loaded_foot
@@ -611,6 +654,25 @@ def walk_tick(
         gait._swing_command = dict(swing_pose)
     else:
         gait._swing_command = {}
+    # The touchdown policy, when one is loaded, may add a clipped centre-of-mass
+    # residual during late swing. With no agent the reference is unchanged.
+    # The copy below is the reference before that residual, kept for the log.
+    deterministic_com = np.asarray(reference["com"], dtype=float)
+    if deterministic_com.ndim == 2:
+        deterministic_com = deterministic_com[0]
+    deterministic_com = deterministic_com.reshape(3).copy()
+    rl_log = {
+        "rl_active": 0.0,
+        "rl_action": np.zeros(2),
+        "rl_residual": np.zeros(2),
+        "rl_inference_s": 0.0,
+        "touchdown_detected": 0.0,
+        "stable_double_support": 0.0,
+    }
+    if touchdown_agent is not None:
+        reference, rl_log = touchdown_agent.correct(
+            env, reference, gait, cbf, command, swing, state_now, rows, polygon
+        )
     row = control_step(
         env,
         mpc,
@@ -671,6 +733,69 @@ def walk_tick(
         row[f"capture_margin_{short}"] = margin + sign * float(capture[axis] - com_now[axis])
     rotation = np.asarray(row["base_rotation"], dtype=float).reshape(3, 3)
     row["pelvis_pitch"] = float(np.arctan2(-rotation[2, 0], np.hypot(rotation[2, 1], rotation[2, 2])))
+    row["pelvis_roll"] = float(np.arctan2(rotation[2, 1], rotation[2, 2]))
+    row["com_reference_deterministic"] = deterministic_com
+    row["loaded_foot"] = gait.loaded_foot or ""
+    duration = float(gait.config.step_duration)
+    if command.state in (WalkState.RIGHT_SWING, WalkState.LEFT_SWING) and duration > 0.0:
+        row["swing_progress"] = float(np.clip(gait._t_state / duration, 0.0, 1.0))
+    else:
+        row["swing_progress"] = 0.0
+    row["swing_height_ref"] = float(gait.config.step_height)
+    row["left_foot_des"] = np.asarray(command.left_foot, dtype=float).reshape(3).copy()
+    row["right_foot_des"] = np.asarray(command.right_foot, dtype=float).reshape(3).copy()
+    if swing == "right":
+        swing_target = command.right_foot
+    elif swing == "left":
+        swing_target = command.left_foot
+    else:
+        swing_target = np.full(3, np.nan)
+    row["swing_target"] = np.asarray(swing_target, dtype=float).reshape(3).copy()
+    for joint_name, field in (
+        ("hip_pitch", "swing_ik_hip_pitch"),
+        ("knee", "swing_ik_knee"),
+        ("ankle", "swing_ik_ankle"),
+    ):
+        if swing:
+            row[field] = float(pose.get(f"{swing}_{joint_name}", np.nan))
+        else:
+            row[field] = np.nan
+    previous_state = str(rows[-1]["walk_state"]) if rows else ""
+    row["touchdown"] = float(
+        row["walk_state"] == "DOUBLE_SUPPORT" and previous_state in ("RIGHT_SWING", "LEFT_SWING")
+    )
+    margin_side = swing and ("left" if swing == "right" else "right")
+    if not margin_side:
+        margin_side = shift.side or ""
+    if margin_side == "left":
+        row["outer_support_margin"] = float(row.get("support_y_upper", np.nan))
+        row["inner_support_margin"] = float(row.get("support_y_lower", np.nan))
+        row["outer_capture_margin"] = float(row.get("capture_margin_y_upper", np.nan))
+        row["inner_capture_margin"] = float(row.get("capture_margin_y_lower", np.nan))
+    elif margin_side == "right":
+        row["outer_support_margin"] = float(row.get("support_y_lower", np.nan))
+        row["inner_support_margin"] = float(row.get("support_y_upper", np.nan))
+        row["outer_capture_margin"] = float(row.get("capture_margin_y_lower", np.nan))
+        row["inner_capture_margin"] = float(row.get("capture_margin_y_upper", np.nan))
+    else:
+        row["outer_support_margin"] = np.nan
+        row["inner_support_margin"] = np.nan
+        row["outer_capture_margin"] = np.nan
+        row["inner_capture_margin"] = np.nan
+    row["rear_capture_margin"] = float(row.get("capture_margin_x_lower", np.nan))
+    row["front_capture_margin"] = float(row.get("capture_margin_x_upper", np.nan))
+    stance_xy_now = np.asarray(row["stance_foot_xy"], dtype=float).reshape(2)
+    row["com_to_stance"] = float(np.linalg.norm(np.asarray(row["com"][:2], dtype=float) - stance_xy_now))
+    row["push_active"] = 0.0
+    row["push_force"] = np.zeros(3)
+    row.update(rl_log)
+    if touchdown_agent is not None:
+        parts = touchdown_agent.update_after_step(row)
+        row["rl_reward"] = float(parts.get("total", 0.0))
+        row["rl_reward_components"] = parts
+        row["touchdown_detected"] = float(touchdown_agent.touchdown)
+        row["stable_double_support"] = float(touchdown_agent.stable)
+        row["episode_failure_reason"] = touchdown_agent.reason
     return row
 
 
@@ -723,9 +848,10 @@ def apply_push(env: IndustrialHumanoidEnv, force: np.ndarray) -> str:
     return "root"
 
 
-def save_log(path: Path, rows: list[dict]) -> None:
-    """Write COM position, the COM reference and the tracking error to ``path``."""
+def save_log(path: Path, rows: list[dict], metadata: dict | None = None) -> None:
+    """Write the rollout. The NPZ keeps every numeric field on the rows."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    write_experiment_log(path, rows, metadata)
     time_s = np.array([row["time"] for row in rows])
     com = np.vstack([row["com"] for row in rows])
     com_reference = np.vstack([row["com_reference"] for row in rows])
@@ -733,33 +859,21 @@ def save_log(path: Path, rows: list[dict]) -> None:
     com_velocity = np.vstack([row["com_velocity"] for row in rows])
     intervention = np.array([row["intervention"] for row in rows])
     status = np.array([row["cbf_status"] for row in rows])
-    ankle_xy = np.stack([row["ankle_xy"] for row in rows])
     walk_state = np.array([row.get("walk_state", "STAND") for row in rows])
     support_foot = np.array([row.get("support_foot", "both") for row in rows])
     stance_foot_xy = np.vstack(
         [np.asarray(row.get("stance_foot_xy", [0.0, 0.0]), dtype=float).reshape(2) for row in rows]
     )
     support_gap = np.array([float(row.get("support_distance", 0.0)) for row in rows])
-    np.savez(
-        path,
-        time=time_s,
-        com=com,
-        com_reference=com_reference,
-        com_error=com_error,
-        com_velocity=com_velocity,
-        intervention=intervention,
-        cbf_status=status,
-        ankle_xy=ankle_xy,
-        walk_state=walk_state,
-        support_foot=support_foot,
-        stance_foot_xy=stance_foot_xy,
-        support_distance=support_gap,
+    rl_active = np.array([float(row.get("rl_active", 0.0)) for row in rows])
+    rl_residual = np.vstack(
+        [np.asarray(row.get("rl_residual", [0.0, 0.0]), dtype=float).reshape(2) for row in rows]
     )
     csv_path = path.with_suffix(".csv")
     header = (
         "time,com_x,com_y,com_z,ref_x,ref_y,ref_z,err_x,err_y,err_z,"
         "com_vx,com_vy,com_vz,intervention,cbf_status,walk_state,support_foot,"
-        "stance_x,stance_y,support_distance"
+        "stance_x,stance_y,support_distance,rl_active,rl_dx,rl_dy"
     )
     lines = [header]
     for i in range(time_s.size):
@@ -769,17 +883,58 @@ def save_log(path: Path, rows: list[dict]) -> None:
             f"{com_error[i, 0]:.6f},{com_error[i, 1]:.6f},{com_error[i, 2]:.6f},"
             f"{com_velocity[i, 0]:.6f},{com_velocity[i, 1]:.6f},{com_velocity[i, 2]:.6f},"
             f"{intervention[i]:.6f},{status[i]},{walk_state[i]},{support_foot[i]},"
-            f"{stance_foot_xy[i, 0]:.6f},{stance_foot_xy[i, 1]:.6f},{support_gap[i]:.6f}"
+            f"{stance_foot_xy[i, 0]:.6f},{stance_foot_xy[i, 1]:.6f},{support_gap[i]:.6f},"
+            f"{rl_active[i]:.0f},{rl_residual[i, 0]:.6f},{rl_residual[i, 1]:.6f}"
         )
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _finish_log(args: argparse.Namespace, env: IndustrialHumanoidEnv, log_path: Path, rows: list[dict]) -> None:
+def _run_metadata(args: argparse.Namespace, mpc: WholeBodyMPC, touchdown_agent) -> dict:
+    """Identifiers and constants for the log header. Not a control input."""
+    if bool(getattr(args, "rl_touchdown", False)):
+        name = "touchdown_rl"
+    elif not args.walk:
+        name = "standing_push"
+    elif int(args.steps) <= 1:
+        name = "walking_single_step"
+    else:
+        name = "walking_multi_step"
+    metadata = {
+        "experiment": name,
+        "seed": int(args.seed),
+        "control_dt": float(args.control_dt),
+        "horizon": int(args.horizon),
+        "walk": bool(args.walk),
+        "n_steps": int(args.steps) if args.walk else 0,
+        "step_length": float(getattr(args, "step_length", 0.1)) if args.walk else None,
+        "step_duration": float(getattr(args, "step_duration", 0.8)) if args.walk else None,
+        "step_height": 0.05 if args.walk else None,
+        "first_swing": "right" if args.walk else "",
+        "push_force_command": np.asarray(args.push_force, dtype=float).tolist() if not args.walk else [0.0, 0.0, 0.0],
+        "push_window_s": [PUSH_TIME, PUSH_TIME + PUSH_DURATION] if not args.walk else None,
+        "joint_names": list(mpc._joint_names),
+        "joint_low": np.asarray(mpc._joint_low, dtype=float),
+        "joint_high": np.asarray(mpc._joint_high, dtype=float),
+        "fall_height_m": 0.72,
+    }
+    if touchdown_agent is not None:
+        metadata["residual_bound"] = np.asarray(touchdown_agent.config.bounds(), dtype=float)
+        metadata["rl_model"] = str(getattr(args, "rl_model", ""))
+    return metadata
+
+
+def _finish_log(
+    args: argparse.Namespace,
+    env: IndustrialHumanoidEnv,
+    log_path: Path,
+    rows: list[dict],
+    metadata: dict | None = None,
+) -> None:
     """Write the demo log, and a swing summary when this run was walking."""
     try:
         if not rows:
             return
-        save_log(log_path, rows)
+        save_log(log_path, rows, metadata)
         interventions = np.array([row["intervention"] for row in rows])
         LOG.info(
             "closed after %.2f s, %d steps. peak intervention %.2f Nm. log: %s",
@@ -839,7 +994,18 @@ def run_demo(args: argparse.Namespace) -> Path:
         # rear face and the filter would throw the robot over.
         cbf.config.margin = 0.0
         cbf.set_support_polygon(support_polygon(env, ("left", "right")))
+    touchdown_agent = None
+    if bool(getattr(args, "rl_touchdown", False)):
+        model_path = str(getattr(args, "rl_model", "") or "")
+        if not model_path:
+            raise SystemExit("--rl-touchdown requires --rl-model PATH")
+        from rl.touchdown import TouchdownAgent
+
+        touchdown_agent = TouchdownAgent(deterministic=True)
+        touchdown_agent.load(Path(model_path))
+        LOG.info("touchdown policy loaded from %s", model_path)
     log_path = Path(args.log_path)
+    log_meta = _run_metadata(args, mpc, touchdown_agent)
     rows: list[dict] = []
     pushed = False
     next_report = 1.0
@@ -875,6 +1041,7 @@ def run_demo(args: argparse.Namespace) -> Path:
                 freeze_swing=bool(getattr(args, "freeze_swing", False)),
                 late_swing_capture=bool(getattr(args, "late_swing_capture", False)),
                 landing_handoff=bool(getattr(args, "landing_handoff", False)),
+                touchdown_agent=touchdown_agent,
             )
         reference = fixed_reference
         if not pushed and sim_time >= PUSH_TIME:
@@ -887,7 +1054,11 @@ def run_demo(args: argparse.Namespace) -> Path:
                 PUSH_DURATION,
                 body,
             )
-        return control_step(env, mpc, cbf, pd, reference)
+        row = control_step(env, mpc, cbf, pd, reference)
+        active = PUSH_TIME <= float(sim_time) < PUSH_TIME + PUSH_DURATION
+        row["push_active"] = float(active)
+        row["push_force"] = np.asarray(args.push_force, dtype=float).copy() if active else np.zeros(3)
+        return row
 
     if bool(getattr(args, "headless", False)):
         duration = float(getattr(args, "duration", 24.0))
@@ -899,7 +1070,7 @@ def run_demo(args: argparse.Namespace) -> Path:
                     LOG.info("stopped: pelvis height %.3f m", float(row["com"][2]))
                     break
         finally:
-            _finish_log(args, env, log_path, rows)
+            _finish_log(args, env, log_path, rows, log_meta)
         return log_path
 
     # launch_passive returns immediately. The loop below is what keeps the
@@ -947,7 +1118,7 @@ def run_demo(args: argparse.Namespace) -> Path:
                 time.sleep(remaining)
     finally:
         viewer.close()
-        _finish_log(args, env, log_path, rows)
+        _finish_log(args, env, log_path, rows, log_meta)
     return log_path
 
 
@@ -1017,6 +1188,17 @@ def parse_args() -> argparse.Namespace:
         "--landing-handoff",
         action="store_true",
         help="hold the touchdown reference and landed-leg command through early double support",
+    )
+    parser.add_argument(
+        "--rl-touchdown",
+        action="store_true",
+        help="add the trained late-swing touchdown residual; requires --rl-model",
+    )
+    parser.add_argument(
+        "--rl-model",
+        type=str,
+        default="",
+        help="touchdown checkpoint (.pt) used with --rl-touchdown",
     )
     parser.add_argument(
         "--headless",

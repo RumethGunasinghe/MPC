@@ -1,0 +1,19 @@
+Component tests and full-system runs are different checks.
+
+Component tests
+---------------
+python -m tests.test_lateral_shift
+6 passed
+
+python -m tests.test_touchdown
+6 passed
+
+These tests check planner, inverse kinematics, the shift reference, the
+touchdown observation, the residual clip, and the per-step cost used by the
+Lagrange multiplier. They do not show that the robot completes a stable step.
+
+Full-system runs
+----------------
+The standing push, one-step walk, multi-step schedule and touchdown-residual
+rollouts are MuJoCo experiments. Their figures are in data/figures/. A passing
+unit test does not mean the landing or a multi-step gait succeeded.
