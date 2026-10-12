@@ -1,0 +1,52 @@
+{
+  "duration_s": 6.519999999999504,
+  "steps": 326,
+  "push_n": 80.0,
+  "push_window_s": [
+    2.0,
+    2.2
+  ],
+  "reference_com_m": [
+    0.07946799999999998,
+    0.0,
+    0.9504214823211519
+  ],
+  "settled_com_m": [
+    0.07055133075344033,
+    0.00028006470372228726,
+    0.9315524927540566
+  ],
+  "peak_pitch_deg": 12.507155948220616,
+  "peak_speed_m_s": 0.17720763406385112,
+  "peak_forward_com_m": 0.12663427314670261,
+  "peak_intervention_nm": 120.26912150704132,
+  "min_barrier_m": -0.038494500948914406,
+  "final_com_m": [
+    0.0704751328038,
+    0.00037256543753263853,
+    0.9284789871102664
+  ],
+  "final_pitch_deg": -0.021852565328152287,
+  "intervention_steps": 76,
+  "relaxed_steps": 54,
+  "windows": {
+    "before": {
+      "peak_speed": 0.008361069368522014,
+      "peak_pitch": 0.16777521088041972,
+      "peak_intervention": 8.071347376515455e-13,
+      "mean_height": 0.9317659961760201
+    },
+    "during push": {
+      "peak_speed": 0.17720763406385112,
+      "peak_pitch": 5.918491000098352,
+      "peak_intervention": 114.9476476228853,
+      "mean_height": 0.9385253287224732
+    },
+    "after": {
+      "peak_speed": 0.14412621032164372,
+      "peak_pitch": 12.507155948220616,
+      "peak_intervention": 120.26912150704132,
+      "mean_height": 0.9474140758622553
+    }
+  }
+}

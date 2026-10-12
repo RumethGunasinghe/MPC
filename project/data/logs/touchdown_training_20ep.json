@@ -1,0 +1,9 @@
+{
+  "source": "Console printout of python -m rl.touchdown_train --episodes 20 --seed 0 --out data/runs/touchdown_costfix_20ep.pt",
+  "checkpoint": "data/runs/touchdown_costfix_20ep.pt",
+  "episodes_requested": 20,
+  "logged_updates": "Every second episode, when the batch reached 64 steps. The steps column is the batch length.",
+  "cost": "mean per-step CBF cost compared with cost_budget 0.5",
+  "stable_touchdowns": 0,
+  "five_hundred_episode_run": "No completed 500-episode log or checkpoint was found. That run is not plotted."
+}

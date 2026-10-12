@@ -1,0 +1,34 @@
+{
+  "baseline_log": "C:\\Users\\rumet\\Desktop\\MPC new\\project\\data\\logs\\walking_single_step_latest.npz",
+  "rl_log": "C:\\Users\\rumet\\Desktop\\MPC new\\project\\data\\logs\\touchdown_rl_latest.npz",
+  "seed": 0,
+  "note": "One identical seed. A rate of 0 or 1 is that single trial, not a multi-seed study. This comparison does not show a reliable landing.",
+  "baseline": {
+    "touchdown_rate": 1.0,
+    "stable_landing_rate": 0.0,
+    "fall_rate": 1.0,
+    "mean_time_to_stable_s": -1.0,
+    "min_support_margin_m": -0.5509776771102544,
+    "min_capture_margin_m": -0.9664986690632636,
+    "peak_abs_vy_m_s": 1.5513338758703614,
+    "vy_at_double_support_m_s": 0.04394941421342925,
+    "mean_cbf_intervention_nm": 6.3813662031744816,
+    "peak_cbf_intervention_nm": 133.89848281323134,
+    "mean_rl_residual_m": 0.0,
+    "max_rl_residual_m": 0.0
+  },
+  "rl": {
+    "touchdown_rate": 1.0,
+    "stable_landing_rate": 0.0,
+    "fall_rate": 1.0,
+    "mean_time_to_stable_s": -1.0,
+    "min_support_margin_m": -0.5518109595492106,
+    "min_capture_margin_m": -0.967551235845605,
+    "peak_abs_vy_m_s": 1.5556938050851434,
+    "vy_at_double_support_m_s": 0.04199815837482118,
+    "mean_cbf_intervention_nm": 6.339609803698358,
+    "peak_cbf_intervention_nm": 133.8676343201693,
+    "mean_rl_residual_m": 0.00022714863009362345,
+    "max_rl_residual_m": 0.0070063841025787684
+  }
+}

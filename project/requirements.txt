@@ -1,0 +1,26 @@
+# Python 3.10 (pins verified against the pip resolver on CPython 3.10)
+
+# Simulation
+mujoco==3.14.0
+mujoco-python-viewer==0.1.4
+gymnasium==1.3.0
+
+# Optimization
+# cvxpy 1.7 requires the osqp 1.x API and scs >= 3.2.4.post1
+cvxpy==1.7.5
+osqp==1.1.3
+scs==3.3.1
+
+# Numerics
+numpy==2.2.6
+scipy==1.15.3
+
+# Safe reinforcement learning
+torch==2.14.0
+stable-baselines3==2.9.0
+
+# Logging and analysis
+matplotlib==3.10.9
+pandas==2.3.3
+tensorboard==2.21.0
+PyYAML==6.0.3
