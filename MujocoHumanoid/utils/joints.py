@@ -1,0 +1,17 @@
+# Joint IDs (from your output)
+
+LEFT_HIP  = 3
+LEFT_KNEE = 4
+RIGHT_HIP = 8
+RIGHT_KNEE = 9
+
+SHOULDER = 12
+ELBOW = 15
+
+LEFT_HIP_ROLL = 2
+RIGHT_HIP_ROLL = 7
+
+LEFT_ANKLE = 5
+RIGHT_ANKLE = 10
+
+TORSO = 11
