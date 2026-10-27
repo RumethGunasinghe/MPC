@@ -155,6 +155,61 @@ def check_solver_uses_measured_feet(env, mpc) -> None:
     assert abs(float(shift.target_xy[1]) - float(real.mean(axis=0)[1])) < 1e-9
 
 
+def test_default_shift_still_brakes_when_lateral_speed_is_high():
+    shift = LateralWeightShift(None)
+    shift.solved = True
+    shift.side = "left"
+    shift.fraction = 0.4
+    shift.blend_rate = 0.05
+    shift.origin_xy = np.zeros(2)
+    shift.target_xy = np.array([0.04, 0.20])
+    shift.sole_low = np.array([-0.02, 0.18])
+    shift.sole_high = np.array([0.16, 0.22])
+    shift._on_sole = False
+    shift.mode = "shift"
+    shift.advance(0.02, np.array([0.04, 0.02, 0.95]), np.array([0.0, 0.10, 0.0]))
+    assert shift.fraction < 0.4
+    assert shift.limit == "lateral_brake"
+
+
+def test_walking_shift_keeps_leaning_until_the_capture_arrives():
+    shift = LateralWeightShift(None)
+    shift.solved = True
+    shift.side = "left"
+    shift.fraction = 0.4
+    shift.blend_rate = 0.35
+    shift.origin_xy = np.zeros(2)
+    shift.target_xy = np.array([0.04, 0.20])
+    shift.sole_low = np.array([-0.02, 0.18])
+    shift.sole_high = np.array([0.16, 0.22])
+    shift._on_sole = False
+    shift.mode = "shift"
+    shift.advance(0.02, np.array([0.04, 0.02, 0.95]), np.array([0.0, 0.02, 0.0]))
+    assert shift.fraction > 0.4
+    assert shift.limit == "moving"
+    fast = shift.fraction
+    shift.advance(0.02, np.array([0.04, 0.02, 0.95]), np.array([0.0, 0.20, 0.0]))
+    assert shift.fraction < fast
+    assert shift.limit == "lateral_brake"
+
+
+def test_next_shift_starts_from_the_pose_already_holding_the_body():
+    shift = LateralWeightShift(None)
+    shift.solved = True
+    shift.side = "right"
+    shift.fraction = 0.0
+    shift.pose = {"left_hip_roll": 0.25}
+    shift.origin_pose = {"left_hip_roll": -0.20}
+    q_des = shift.apply(
+        np.zeros(1),
+        ["left_hip_roll"],
+        np.zeros(1),
+        np.array([-0.5]),
+        np.array([0.5]),
+    )
+    assert abs(float(q_des[0]) - (-0.20)) < 1e-9
+
+
 def main() -> None:
     checks = []
     env, mpc, cbf, pd = build_stack(_args())

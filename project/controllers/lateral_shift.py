@@ -90,6 +90,14 @@ class LateralWeightShift:
         self.load_transfer_hip_roll = 0.0
         self.load_transfer_hip_roll_limit = 0.0
         self.preparation_hold = False
+        # Fraction per second. 0.05 is the original creep and keeps the
+        # speed brake. A faster walk keeps leaning until the capture point
+        # reaches the sole.
+        self.blend_rate = 0.05
+        # Joint pose the next blend starts from. Empty means the home pose,
+        # which is the first shift. A later shift starts from the pose that
+        # was already holding the body up.
+        self.origin_pose: dict[str, float] = {}
 
     def begin(
         self,
@@ -109,8 +117,18 @@ class LateralWeightShift:
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
         corners = np.asarray(sole_corners, dtype=float).reshape(-1, 2)
+        carried: dict[str, float] = {}
+        if self.pose and self.solved:
+            frac = float(np.clip(self.fraction, 0.0, 1.0))
+            for name, goal in self.pose.items():
+                if name in self.origin_pose:
+                    base = float(self.origin_pose[name])
+                else:
+                    base = float(home.get(name, goal))
+                carried[name] = (1.0 - frac) * base + frac * float(goal)
         self.side = side
         self.fraction = 0.0
+        self.origin_pose = carried
         self.skip_side = ""
         self._trim_anchor = None
         self.handoff_xy = None
@@ -179,7 +197,14 @@ class LateralWeightShift:
         )
         toward = float(vel[1]) * sign
         close = gap < 0.05
-        braking = (close and toward > 0.02) or capture_in or toward > 0.04
+        if float(self.blend_rate) <= 0.06:
+            braking = (close and toward > 0.02) or capture_in or toward > 0.04
+        else:
+            # Servo a slow approach. The full solved pose, applied too quickly,
+            # tips the body over the outer edge of the sole.
+            distance = max(0.0, float(gap))
+            approach = min(0.06, 0.6 * distance)
+            braking = bool(toward > approach + 0.015) or bool(capture_in and toward > 0.03)
         if inside and abs(toward) < 0.03:
             # Latched only after a slow arrival. A fly-through used to set
             # this while still moving, and holding that lean threw the swing.
@@ -223,7 +248,7 @@ class LateralWeightShift:
             self.fraction = max(0.0, self.fraction - 0.20 * float(dt))
         elif short and self.fraction < 1.0:
             self.limit = "moving"
-            self.fraction = min(1.0, self.fraction + 0.05 * float(dt))
+            self.fraction = min(1.0, self.fraction + float(self.blend_rate) * float(dt))
         else:
             self.limit = "capture_at_target"
         reference = (1.0 - self.fraction) * self.origin_xy + self.fraction * self.target_xy
@@ -310,7 +335,7 @@ class LateralWeightShift:
         and knee keep a small piece of the MPC command so the ankles can still
         balance fore-aft. Ankle pitch then levels the sole, plus that residual.
         """
-        if not self.solved or self.side is None or self.fraction <= 0.0:
+        if not self.solved or self.side is None or (self.fraction <= 0.0 and not self.origin_pose):
             return np.asarray(q_mpc, dtype=float).copy()
         q_des = np.asarray(q_mpc, dtype=float).copy()
         home = np.asarray(home, dtype=float)
@@ -337,7 +362,11 @@ class LateralWeightShift:
                 self.hip_roll_capture_available[name] = available
                 self.hip_roll_capture[name] = 0.0
                 continue
-            blended = (1.0 - fraction) * float(home[i]) + fraction * float(goal)
+            if name in self.origin_pose:
+                base = float(self.origin_pose[name])
+            else:
+                base = float(home[i])
+            blended = (1.0 - fraction) * base + fraction * float(goal)
             if skip and name.startswith(f"{skip}_"):
                 # Pitch and knee stay on the touchdown command written into
                 # home: q_mpc would add the capture offset on the landing tick,

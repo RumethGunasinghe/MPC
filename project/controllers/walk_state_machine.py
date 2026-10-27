@@ -67,10 +67,12 @@ class WalkState(Enum):
     """Discrete phase of the gait."""
 
     STAND = "STAND"
+    PREPARE_STEP = "PREPARE_STEP"
     SHIFT_LEFT = "SHIFT_LEFT"
     RIGHT_SWING = "RIGHT_SWING"
     TOUCHDOWN_PREP = "TOUCHDOWN_PREP"
     TOUCHDOWN = "TOUCHDOWN"
+    SUPPORT_TRANSFER = "SUPPORT_TRANSFER"
     DOUBLE_SUPPORT_RECOVERY = "DOUBLE_SUPPORT_RECOVERY"
     DOUBLE_SUPPORT = "DOUBLE_SUPPORT"
     SHIFT_RIGHT = "SHIFT_RIGHT"
@@ -82,6 +84,7 @@ class WalkState(Enum):
 # the foot the centre of mass was shifted onto in the previous state.
 _SUPPORT = {
     WalkState.STAND: "both",
+    WalkState.PREPARE_STEP: "both",
     WalkState.SHIFT_LEFT: "left",
     WalkState.RIGHT_SWING: "left",
     WalkState.DOUBLE_SUPPORT: "both",
@@ -168,6 +171,15 @@ class WalkConfig:
             original target unchanged.
         adaptive_placement_end: Swing progress at which the ramp reaches the
             full requested correction. Later progress holds that value.
+        capture_step: When true, the swing landing tracks a capture-point
+            foot target supplied by the walking tick. The centre of mass is
+            not required to reach that landing before touchdown. The swing
+            also waits in ``PREPARE_STEP``, with both feet down, until the
+            caller says the capture point is inside a reachable sole.
+            Default false leaves the footstep landing and the shift unchanged.
+        prepare_margin: Metres the capture point must sit inside the feasible
+            sole interval before the swing may start. Small on purpose.
+        prepare_speed: How fast the preparation reference may move, in m/s.
     """
 
     step_length: float = 0.1
@@ -201,6 +213,12 @@ class WalkConfig:
     max_lateral_step_adjustment: float = 0.04
     adaptive_placement_start: float = 0.10
     adaptive_placement_end: float = 0.50
+    capture_step: bool = False
+    prepare_margin: float = 0.01
+    prepare_speed: float = 0.08
+    # How fast the planted-foot weight shift blends toward the solved pose.
+    # 0.05 is the original creep. The walking demo uses a faster arrival.
+    shift_blend_rate: float = 0.05
 
     def __post_init__(self) -> None:
         self.forward = np.asarray(self.forward, dtype=float).reshape(3)
@@ -233,6 +251,10 @@ class WalkConfig:
             raise ValueError("stabilization_dwell must be non-negative")
         if self.capture_margin < 0.0:
             raise ValueError("capture_margin must be non-negative")
+        if self.prepare_margin < 0.0:
+            raise ValueError("prepare_margin must be non-negative")
+        if self.prepare_speed < 0.0:
+            raise ValueError("prepare_speed must be non-negative")
         if self.max_abs_vx < 0.0 or self.max_abs_vy < 0.0:
             raise ValueError("velocity limits must be non-negative")
         if self.load_transfer_duration < 0.0:
@@ -380,6 +402,8 @@ class WalkingStateMachine:
         self._swing_elapsed = 0.0
         self._confirm = 0
         self._dwell = 0.0
+        self._support_dwell = 0.0
+        self._support_transfer_accepted = False
         self._recover_time = 0.0
         self._adaptive_correction = 0.0
         self._adaptive_requested = 0.0
@@ -453,7 +477,11 @@ class WalkingStateMachine:
     @property
     def loaded_foot(self) -> str | None:
         """Foot the centre of mass must be over before the other foot may lift."""
-        landing = self._state in (WalkState.TOUCHDOWN_PREP, WalkState.TOUCHDOWN)
+        landing = self._state in (
+            WalkState.TOUCHDOWN_PREP,
+            WalkState.TOUCHDOWN,
+            WalkState.SUPPORT_TRANSFER,
+        )
         if self._state in (WalkState.SHIFT_LEFT, WalkState.RIGHT_SWING) or (
             landing and self._active_swing == "right"
         ):
@@ -519,6 +547,9 @@ class WalkingStateMachine:
         placement_reachable: bool = True,
         stance_foot_y: float | None = None,
         stance_inner_y: float | None = None,
+        capture_landing: np.ndarray | None = None,
+        preparation_complete: bool = False,
+        support_transfer_stable: bool | None = None,
     ) -> WalkOutput:
         """Advance one control period.
 
@@ -548,20 +579,30 @@ class WalkingStateMachine:
             self._swing_elapsed += float(dt)
         if self._state is WalkState.DOUBLE_SUPPORT_RECOVERY:
             self._recover_time += float(dt)
-        if not self._terminal and self._state in (
+        if self._state is WalkState.PREPARE_STEP and bool(preparation_complete):
+            self._transition()
+        elif not self._terminal and self._state in (
             WalkState.STAND,
             WalkState.SHIFT_LEFT,
             WalkState.SHIFT_RIGHT,
         ):
             if self._shift_complete(bool(support_ready)):
                 self._transition()
-        self._apply_adaptive_placement(
-            capture_xy,
-            bool(placement_reachable),
-            stance_foot_y,
-            stance_inner_y,
+        if bool(self.config.capture_step):
+            self._apply_capture_landing(capture_landing)
+        else:
+            self._apply_adaptive_placement(
+                capture_xy,
+                bool(placement_reachable),
+                stance_foot_y,
+                stance_inner_y,
+            )
+        self._advance_touchdown(
+            float(dt),
+            bool(foot_sample_ok),
+            bool(recovery_sample_ok),
+            support_transfer_stable,
         )
-        self._advance_touchdown(float(dt), bool(foot_sample_ok), bool(recovery_sample_ok))
         return self._emit()
 
     def _requested_lateral_correction(
@@ -659,7 +700,35 @@ class WalkingStateMachine:
         self._adaptive_correction = float(applied)
         self._adaptive_fallback = False
 
-    def _advance_touchdown(self, dt: float, foot_ok: bool, recovery_ok: bool) -> None:
+    def _apply_capture_landing(self, landing: np.ndarray | None) -> None:
+        """Replace the swing landing xy. Height and the liftoff stay put.
+
+        ``None`` leaves the nominal step. Touchdown confirmation reads the
+        target already stored here, so adaptation has to stop before that
+        state. The walking tick freezes the vector it passes in.
+        """
+        if landing is None or self._swing_target is None:
+            return
+        if self._state not in (
+            WalkState.RIGHT_SWING,
+            WalkState.LEFT_SWING,
+            WalkState.TOUCHDOWN_PREP,
+        ):
+            return
+        point = np.asarray(landing, dtype=float).reshape(-1)
+        if point.size < 2:
+            return
+        self._swing_target = self._swing_target.copy()
+        self._swing_target[0] = float(point[0])
+        self._swing_target[1] = float(point[1])
+
+    def _advance_touchdown(
+        self,
+        dt: float,
+        foot_ok: bool,
+        recovery_ok: bool,
+        support_transfer_stable: bool | None = None,
+    ) -> None:
         """Move through prep, contact confirmation, and recovery.
 
         The phase at the start of the call is the only one that can advance.
@@ -689,6 +758,25 @@ class WalkingStateMachine:
                 self._confirm = 0
             if self._confirm >= int(cfg.touchdown_confirm_ticks):
                 self._count_step()
+                self._dwell = 0.0
+                self._recover_time = 0.0
+                self._support_dwell = 0.0
+                if bool(self.config.capture_step) and support_transfer_stable is not None:
+                    self._enter(WalkState.SUPPORT_TRANSFER)
+                else:
+                    self._enter(WalkState.DOUBLE_SUPPORT_RECOVERY)
+            return
+        if started is WalkState.SUPPORT_TRANSFER:
+            # Force on the new foot is not a support switch. The sample has
+            # to stay inside the stability limits for the dwell. Until then
+            # the old foot remains the support.
+            if bool(support_transfer_stable):
+                self._support_dwell = float(getattr(self, "_support_dwell", 0.0)) + max(0.0, float(dt))
+            else:
+                self._support_dwell = 0.0
+            self._support_transfer_accepted = False
+            if self._support_dwell >= float(cfg.stabilization_dwell):
+                self._support_transfer_accepted = True
                 self._dwell = 0.0
                 self._recover_time = 0.0
                 self._enter(WalkState.DOUBLE_SUPPORT_RECOVERY)
@@ -738,6 +826,7 @@ class WalkingStateMachine:
             steps_done=self._steps_done,
             n_steps=self._n_steps,
             next_swing=self._next_swing,
+            capture_step=bool(self.config.capture_step),
         )
         self._swing_target = None
         self._original_swing_target = None
@@ -771,6 +860,10 @@ class WalkingStateMachine:
         cfg = self.config
         if state is WalkState.STAND:
             return float(cfg.stand_duration) if not self._terminal else np.inf
+        if state is WalkState.PREPARE_STEP:
+            return np.inf
+        if state is WalkState.SUPPORT_TRANSFER:
+            return np.inf
         if state in (WalkState.SHIFT_LEFT, WalkState.SHIFT_RIGHT):
             return float(cfg.shift_duration)
         if state in (WalkState.RIGHT_SWING, WalkState.LEFT_SWING):
@@ -793,6 +886,7 @@ class WalkingStateMachine:
             steps_done=self._steps_done,
             n_steps=self._n_steps,
             next_swing=self._next_swing,
+            capture_step=bool(self.config.capture_step),
         )
         # The blend has reached its target by the time a timed state ends.
         self._com_from = self._com_to.copy()
@@ -841,6 +935,11 @@ class WalkingStateMachine:
             self._swing_elapsed = 0.0
             self._swing_target = _landing(self._left, self._right, self.config)
             self._remember_original_landing()
+        elif self._state is WalkState.PREPARE_STEP:
+            # Both feet stay down. The walking tick slews the capture
+            # reference; this target is only the midpoint until that slew.
+            self._com_to = 0.5 * (self._left[:2] + self._right[:2])
+            self._active_swing = None
         elif self._state is WalkState.STAND:
             self._com_to = 0.5 * (self._left[:2] + self._right[:2])
         # DOUBLE_SUPPORT keeps the centre of mass on the foot that just carried
@@ -887,6 +986,7 @@ class WalkingStateMachine:
             WalkState.LEFT_SWING,
             WalkState.TOUCHDOWN_PREP,
             WalkState.TOUCHDOWN,
+            WalkState.SUPPORT_TRANSFER,
         ):
             if self._active_swing == "right":
                 return "left"
@@ -1022,20 +1122,25 @@ def next_state(
     steps_done: int,
     n_steps: int,
     next_swing: str,
+    capture_step: bool = False,
 ) -> WalkState | None:
     """Successor of ``state``, or ``None`` to stay in the terminal stand.
 
-    The support-foot rule is structural: ``RIGHT_SWING`` is reached only
-    from ``SHIFT_LEFT``, and ``LEFT_SWING`` only from ``SHIFT_RIGHT``.
-    ``DOUBLE_SUPPORT`` returns to a shift while swings remain, and to
-    ``STAND`` once they do not.
+    Without capture-step, ``RIGHT_SWING`` is reached only from ``SHIFT_LEFT``
+    and ``LEFT_SWING`` only from ``SHIFT_RIGHT``. With capture-step, the
+    swing waits in ``PREPARE_STEP`` until the caller releases it. Both feet
+    stay down in that state.
     """
     if next_swing not in _FEET:
         raise ValueError(f"next_swing must be 'left' or 'right', got {next_swing!r}")
     if state is WalkState.STAND:
         if steps_done >= n_steps:
             return None
+        if capture_step:
+            return WalkState.PREPARE_STEP
         return WalkState.SHIFT_LEFT if next_swing == "right" else WalkState.SHIFT_RIGHT
+    if state is WalkState.PREPARE_STEP:
+        return WalkState.RIGHT_SWING if next_swing == "right" else WalkState.LEFT_SWING
     if state is WalkState.SHIFT_LEFT:
         return WalkState.RIGHT_SWING
     if state is WalkState.SHIFT_RIGHT:
@@ -1045,6 +1150,8 @@ def next_state(
     if state is WalkState.DOUBLE_SUPPORT:
         if steps_done >= n_steps:
             return WalkState.STAND
+        if capture_step:
+            return WalkState.PREPARE_STEP
         return WalkState.SHIFT_LEFT if next_swing == "right" else WalkState.SHIFT_RIGHT
     raise ValueError(f"unknown state {state!r}")
 
@@ -1110,19 +1217,23 @@ def _build_phases(
             emit(WalkState.STAND, np.inf, com_xy)
             break
 
-        if state is WalkState.SHIFT_LEFT:
+        if state is WalkState.PREPARE_STEP:
+            emit(state, config.shift_duration, com_xy)
+        elif state is WalkState.SHIFT_LEFT:
             emit(state, config.shift_duration, left[:2])
         elif state is WalkState.SHIFT_RIGHT:
             emit(state, config.shift_duration, right[:2])
         elif state is WalkState.RIGHT_SWING:
-            _require_loaded(phases, WalkState.SHIFT_LEFT, "right")
+            if not phases or phases[-1].state is not WalkState.PREPARE_STEP:
+                _require_loaded(phases, WalkState.SHIFT_LEFT, "right")
             target = _landing(right, left, config)
             emit(state, config.step_duration, left[:2], swing_foot="right", swing_target=target)
             right = target
             steps_done += 1
             next_swing = "left"
         elif state is WalkState.LEFT_SWING:
-            _require_loaded(phases, WalkState.SHIFT_RIGHT, "left")
+            if not phases or phases[-1].state is not WalkState.PREPARE_STEP:
+                _require_loaded(phases, WalkState.SHIFT_RIGHT, "left")
             target = _landing(left, right, config)
             emit(state, config.step_duration, right[:2], swing_foot="left", swing_target=target)
             left = target
@@ -1140,6 +1251,7 @@ def _build_phases(
             steps_done=steps_done,
             n_steps=n_steps,
             next_swing=next_swing,
+            capture_step=bool(config.capture_step),
         )
     return phases
 
