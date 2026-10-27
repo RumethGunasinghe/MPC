@@ -512,6 +512,34 @@ class CBFFilter:
         self.config.support_center = (float(center[0]), float(center[1]))
         self.config.support_half_extents = (float(half[0]), float(half[1]))
 
+    def set_support_bounds(self, low: np.ndarray, high: np.ndarray) -> None:
+        """Aim the barrier at an explicit safe box.
+
+        ``low`` and ``high`` are the world-xy faces the centre of mass must
+        stay inside. The QP subtracts ``margin`` from every stored half
+        extent, so the stored box is expanded by that margin and the solved
+        constraint is exactly this one. Standing and early swing keep using
+        :meth:`set_support_polygon`, which insets every face by ``margin``.
+        """
+        safe_low = np.asarray(low, dtype=float).reshape(2).copy()
+        safe_high = np.asarray(high, dtype=float).reshape(2).copy()
+        mid = 0.5 * (safe_low + safe_high)
+        thin = safe_high - safe_low < 1e-3
+        safe_low = np.where(thin, mid - 5e-4, safe_low)
+        safe_high = np.where(thin, mid + 5e-4, safe_high)
+        margin = float(self.config.margin)
+        center = 0.5 * (safe_low + safe_high)
+        half = 0.5 * (safe_high - safe_low) + margin
+        self.config.support_center = (float(center[0]), float(center[1]))
+        self.config.support_half_extents = (float(half[0]), float(half[1]))
+
+    @property
+    def support_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """Safe box actually enforced by the QP, shape ``(2,)`` each."""
+        center = np.asarray(self.config.support_center, dtype=float)
+        half = np.asarray(self.config.support_half_extents, dtype=float) - float(self.config.margin)
+        return center - half, center + half
+
     def com_barrier_values(self, com_position: np.ndarray) -> dict[str, float]:
         """Signed distance of the CoM to each face of the support box.
 

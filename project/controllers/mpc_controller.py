@@ -686,12 +686,13 @@ class WholeBodyMPC:
         reference = np.asarray(task["position_reference"][0, :3], dtype=float)
         omega = np.sqrt(9.81 / max(float(com[2]), 0.2))
         error_x = (com[0] - reference[0]) + vel[0] / omega
-        error_y = (com[1] - reference[1]) + vel[1] / omega
+        capture_y = float(com[1] + vel[1] / omega)
+        hip = lateral_capture_hip_offset(capture_y, float(reference[1]), gain)
         for index, name in enumerate(self._joint_names):
             if "ankle" in name:
                 offset[index] = gain * error_x
             elif "hip_roll" in name:
-                offset[index] = gain * error_y
+                offset[index] = hip
         # A larger shift rolls the foot onto the heel or the toe and the body
         # pivots over that edge. A few degrees is enough to move the centre
         # of pressure.
@@ -749,6 +750,24 @@ def suppress_landed_ankle_capture(
         if name == ankle or str(name).startswith(ankle):
             applied[index] = 0.0
     return applied
+
+
+def lateral_capture_hip_offset(
+    capture_y: float,
+    reference_y: float,
+    gain: float = 12.0,
+    limit: float = 0.15,
+) -> float:
+    """Hip-roll correction that walks the capture point toward ``reference_y``.
+
+    This is the lateral term inside :meth:`WholeBodyMPC._capture_offset`.
+    A capture point above the reference returns a positive angle. On the H1
+    that positive angle, applied to the left hip with the foot planted, moves
+    the pelvis toward negative y. The same negative angle on the right hip
+    moves the pelvis toward positive y. The result is clipped to ``limit``.
+    """
+    error = float(capture_y) - float(reference_y)
+    return float(np.clip(float(gain) * error, -abs(limit), abs(limit)))
 
 
 def _sagittal_capture_offset(offset: np.ndarray, joint_names: list[str]) -> float:

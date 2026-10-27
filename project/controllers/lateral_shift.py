@@ -88,7 +88,8 @@ class LateralWeightShift:
         # Added after the base hip-roll target. Zero outside load transfer.
         # Clipped again in ``_assign_hip_roll`` to this limit.
         self.load_transfer_hip_roll = 0.0
-        self.load_transfer_hip_roll_limit = 0.08
+        self.load_transfer_hip_roll_limit = 0.0
+        self.preparation_hold = False
 
     def begin(
         self,
@@ -116,6 +117,7 @@ class LateralWeightShift:
         self.hold_landed = False
         self._on_sole = False
         self.mode = "shift"
+        self.preparation_hold = False
         self._held_xy = None
         self.origin_xy = np.asarray(com[:2], dtype=float).copy()
         self.target_xy = corners.mean(axis=0)
@@ -188,6 +190,11 @@ class LateralWeightShift:
         elif float(com[2]) < 0.80 and not inside:
             self.limit = "height"
             self.fraction = max(0.0, self.fraction - 2.0 * float(dt))
+        elif self.preparation_hold:
+            # Capture preparation owns the lean for this swing. The brake
+            # that eases the blend off would pull the centre of pressure
+            # back to the inner edge and cancel the step.
+            self.limit = "capture_preparation"
         elif self._on_sole:
             self.limit = "com_inside"
             # The lean is latched for the swing. It is eased only while the

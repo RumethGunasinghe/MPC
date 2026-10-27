@@ -1,4 +1,4 @@
-"""Late-swing lateral landing adjustment.
+"""Airborne lateral landing adjustment.
 
 These checks do not run MuJoCo. Reachability is a flag the walking tick
 sets from the leg IK; the state machine only has to honour it.
@@ -96,28 +96,36 @@ def test_correction_is_bounded_by_8_cm():
     assert abs(float(final.right_foot[0]) - 0.1) < 1e-9
 
 
-def test_correction_ramps_smoothly_and_is_zero_before_065():
-    assert placement_ramp(0.64) == 0.0
-    assert placement_ramp(0.65) == 0.0
+def test_correction_ramps_from_010_to_050_and_then_holds():
+    assert placement_ramp(0.10) == 0.0
+    assert placement_ramp(0.09) == 0.0
+    assert abs(placement_ramp(0.50) - 1.0) < 1e-12
     assert abs(placement_ramp(1.0) - 1.0) < 1e-12
-    earlier = [placement_ramp(progress) for progress in (0.70, 0.80, 0.90, 1.0)]
-    assert earlier == sorted(earlier)
-    # The smoothstep slope is zero at the opening, so the first tick is small.
-    assert placement_ramp(0.67) < 0.02
+    opening = [placement_ramp(progress) for progress in (0.10, 0.20, 0.30, 0.40, 0.50)]
+    assert opening == sorted(opening)
+    # The smoothstep slope is zero at the opening, so the first step is small.
+    assert placement_ramp(0.12) < 0.02
     gait = _machine(True)
     rows, final = _drive(gait, 0.05, 0.2, True)
     assert final is not None
-    swing = [(progress, foot[1]) for state, progress, foot, _correction in rows if state in (
-        WalkState.RIGHT_SWING, WalkState.TOUCHDOWN_PREP, WalkState.TOUCHDOWN
-    )]
-    for progress, y in swing:
-        if progress < 0.65:
+    swing = [
+        (progress, foot[1], correction)
+        for state, progress, foot, correction in rows
+        if state in (WalkState.RIGHT_SWING, WalkState.TOUCHDOWN_PREP, WalkState.TOUCHDOWN)
+    ]
+    for progress, y, correction in swing:
+        if progress <= 0.10:
             assert abs(y - (-0.2)) < 1e-9
-    moving = [y for progress, y in swing if progress >= 0.65]
-    assert moving[0] <= moving[-1]
+            assert abs(correction) < 1e-12
+    moving = [y for progress, y, _correction in swing if 0.10 < progress < 0.50]
+    assert moving
     assert all(moving[i] <= moving[i + 1] + 1e-12 for i in range(len(moving) - 1))
     steps = [abs(moving[i + 1] - moving[i]) for i in range(len(moving) - 1)]
     assert max(steps) < 0.01
+    held = [correction for progress, _y, correction in swing if progress >= 0.50]
+    assert held
+    assert all(abs(correction - held[0]) < 1e-12 for correction in held)
+    assert abs(held[0] - 0.05) < 1e-6
     assert abs(float(final.right_foot[1]) - (-0.15)) < 1e-6
     assert abs(float(final.right_foot[0]) - 0.1) < 1e-9
 
@@ -157,13 +165,13 @@ def test_unreachable_target_falls_back_to_the_original():
     assert abs(float(revived.right_foot[1]) - (-0.2)) < 1e-9
 
 
-def test_no_correction_before_swing_progress_065():
+def test_no_correction_before_swing_progress_010():
     gait = _machine(True)
     rows, _final = _drive(gait, 0.5, 0.2, True)
     early = [
         foot[1]
         for state, progress, foot, _correction in rows
-        if state in (WalkState.RIGHT_SWING, WalkState.TOUCHDOWN_PREP) and progress < 0.65
+        if state in (WalkState.RIGHT_SWING, WalkState.TOUCHDOWN_PREP) and progress <= 0.10
     ]
     assert early
     assert all(abs(y - (-0.2)) < 1e-9 for y in early)
@@ -172,10 +180,10 @@ def test_no_correction_before_swing_progress_065():
 def main() -> None:
     test_disabled_keeps_the_original_target()
     test_correction_is_bounded_by_8_cm()
-    test_correction_ramps_smoothly_and_is_zero_before_065()
+    test_correction_ramps_from_010_to_050_and_then_holds()
     test_capture_correction_has_the_right_sign_on_both_feet()
     test_unreachable_target_falls_back_to_the_original()
-    test_no_correction_before_swing_progress_065()
+    test_no_correction_before_swing_progress_010()
     print("adaptive foot placement tests passed")
 
 

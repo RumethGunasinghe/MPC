@@ -6,7 +6,9 @@ The control stack on every tick is
 
 The MPC holds the torso attitude recorded at reset. In walking mode a state
 machine shifts the centre of mass onto the measured centre of one sole before
-the other foot swings forward. The shift is a blend from the home posture to
+the other foot swings forward. During the swing that reference is replaced
+by a capture-point velocity toward the planned landing sole, still through
+the same MPC. The shift is a blend from the home posture to
 the leg pose that reaches that sole with both feet planted. The swing leg
 tracks its foot with inverse kinematics, and only after the centre of mass is
 inside the stance sole. The CBF keeps the centre of mass inside the soles
@@ -30,6 +32,19 @@ from pathlib import Path
 import numpy as np
 
 from controllers.adaptive_foot_placement import combined_y_margin
+from controllers.capture_point_controller import CapturePreparation
+from controllers.support_transition import (
+    TRANSITION_Y,
+    FallRelease,
+    apply_stance_hip_roll,
+    capture_box_margin,
+    combined_support_active,
+    fall_blend,
+    fall_safe_box,
+    stance_hip_roll_capture_target,
+    stance_inner_edge_y,
+    support_phase,
+)
 from controllers.lateral_shift import LateralWeightShift, support_distance
 from controllers.load_transfer import (
     LoadTransferTracker,
@@ -205,6 +220,25 @@ def walking_reference(
     }
 
 
+# Walking stance-hip tracking only. The standing leg law stays kp 400 / kd 40.
+# On the planted hip, about 30 N·m holds the pose, so kp 400 settles with
+# ~0.07 rad of lag and the 0.15 rad fall does not finish inside the swing.
+# The v1 nominal torque there was 30–75 N·m. The motor is a gear-1 torque
+# source with ctrlrange ±200 N·m, joint damping 1 and no stiffness, so the
+# actuator was not the limit, and once the inner face was open the CBF
+# passed that torque unchanged.
+# kp 1000 and kp 700 both closed that gap inside the swing. The body then
+# kept falling for about a second while the right foot was still in the
+# air, and the pelvis carried that foot out to about -0.38 m before
+# contact. The extra stiffness is therefore only used while the swing is
+# in progress, so the hip moves during the 0.8 s swing and the existing
+# leg gains hold the catch afterwards. Damping scales with sqrt(kp).
+# Torque still goes through PDController, the ±200 N·m clip, and the CBF.
+_WALK_STANCE_HIP_ROLL_KP = 700.0
+_WALK_STANCE_HIP_ROLL_KD = 53.0
+_WALK_STANCE_HIP_ROLL_STATES = ("RIGHT_SWING", "LEFT_SWING")
+
+
 def control_step(
     env: IndustrialHumanoidEnv,
     mpc: WholeBodyMPC,
@@ -249,12 +283,7 @@ def control_step(
         landed_ankle_capture=landed_ankle_capture,
     )
     mpc_solve_s = float(time.perf_counter() - solve_started)
-    q_des = solution["q_des"]
-    if stance_hip_roll is not None:
-        roll_side, roll_angle = stance_hip_roll
-        for index, name in enumerate(mpc._joint_names):
-            if name == f"{roll_side}_hip_roll":
-                q_des[index] = float(np.clip(roll_angle, mpc._joint_low[index], mpc._joint_high[index]))
+    q_des = np.asarray(solution["q_des"], dtype=float).copy()
     if posture is not None:
         # The shift posture replaces the leg targets. It is solved from the
         # measured feet; the MPC's fore-aft residual is kept inside apply().
@@ -265,32 +294,96 @@ def control_step(
         )
     if joint_pose is not None:
         q_des = _compose_step_joints(mpc, q_des, joint_pose, swing_side)
-    qd_des = solution["qd_des"]
+    # Snapshot before the fall write. Swing IK only fills swing-side joints,
+    # so this is the shift blend on the stance hip.
+    q_des_before_walking_override = np.asarray(q_des, dtype=float).copy()
+    # Last write on the stance hip. The shift, the swing IK and the recovery
+    # capture term have already run. This is the target the PD receives.
+    if stance_hip_roll is not None:
+        roll_side, roll_angle = stance_hip_roll
+        q_des = apply_stance_hip_roll(
+            q_des,
+            list(mpc._joint_names),
+            roll_side,
+            float(roll_angle),
+            mpc._joint_low,
+            mpc._joint_high,
+        )
+    q_des = np.asarray(q_des, dtype=float).copy()
+    qd_des = np.asarray(solution["qd_des"], dtype=float)
 
+    names = list(mpc._joint_names)
+    hip_index = names.index("left_hip_roll")
+    saved_hip_gains = None
+    if stance_hip_roll is not None and walk_state in _WALK_STANCE_HIP_ROLL_STATES:
+        stance_index = names.index(f"{stance_hip_roll[0]}_hip_roll")
+        saved_hip_gains = (
+            stance_index,
+            float(pd.kp[stance_index]),
+            float(pd.kd[stance_index]),
+        )
+        pd.kp[stance_index] = _WALK_STANCE_HIP_ROLL_KP
+        pd.kd[stance_index] = _WALK_STANCE_HIP_ROLL_KD
+
+    q_meas = np.asarray(state["joint_qpos"], dtype=float)
+    qd_meas = np.asarray(state["joint_qvel"], dtype=float)
+    position_error = q_des - q_meas
+    velocity_error = qd_des - qd_meas
+    tau_position = pd.kp * position_error
+    tau_velocity = pd.kd * velocity_error
     # One CBF solve per control tick. The modification ``delta`` is held across
     # the physics substeps; the PD and the gravity term are recomputed on every
     # MuJoCo step so the joints can actually hold the target.
     tau_gravity = np.asarray(env.data.qfrc_bias[env._actuator_dof_adr], dtype=float)
-    tau_nominal = pd.compute_torque(
-        q_des,
-        state["joint_qpos"],
-        state["joint_qvel"],
-        desired_velocities=qd_des,
-        torque_feedforward=tau_gravity,
-    )
-    tau_safe = cbf.safe_torque(tau_nominal, state["com"], state["com_velocity"])
-    delta = tau_safe - tau_nominal
-
-    def torque_at_substep() -> np.ndarray:
-        q = env.data.qpos[env._actuator_qpos_adr]
-        qd = env.data.qvel[env._actuator_dof_adr]
-        gravity = np.asarray(env.data.qfrc_bias[env._actuator_dof_adr], dtype=float)
-        torque = pd.compute_torque(
-            q_des, q, qd, desired_velocities=qd_des, torque_feedforward=gravity
+    tau_pd = tau_position + tau_velocity
+    try:
+        tau_nominal = pd.compute_torque(
+            q_des,
+            q_meas,
+            qd_meas,
+            desired_velocities=qd_des,
+            torque_feedforward=tau_gravity,
         )
-        return torque + delta
+        tau_safe = cbf.safe_torque(tau_nominal, state["com"], state["com_velocity"])
+        delta = tau_safe - tau_nominal
+        first_ctrl: dict[str, np.ndarray] = {}
 
-    env.step_feedback(torque_at_substep)
+        def torque_at_substep() -> np.ndarray:
+            q = env.data.qpos[env._actuator_qpos_adr]
+            qd = env.data.qvel[env._actuator_dof_adr]
+            gravity = np.asarray(env.data.qfrc_bias[env._actuator_dof_adr], dtype=float)
+            torque = pd.compute_torque(
+                q_des, q, qd, desired_velocities=qd_des, torque_feedforward=gravity
+            )
+            commanded = torque + delta
+            if "first" not in first_ctrl:
+                first_ctrl["first"] = np.asarray(commanded, dtype=float).copy()
+            return commanded
+
+        env.step_feedback(torque_at_substep)
+        hip_trace = _left_hip_roll_trace(
+            env,
+            hip_index,
+            q_des_before_walking_override,
+            q_des,
+            q_meas,
+            qd_meas,
+            position_error,
+            tau_position,
+            tau_velocity,
+            tau_pd,
+            tau_gravity,
+            tau_nominal,
+            tau_safe,
+            first_ctrl.get("first", tau_safe),
+            float(pd.kp[hip_index]),
+            float(pd.kd[hip_index]),
+        )
+    finally:
+        if saved_hip_gains is not None:
+            stance_index, kp_standing, kd_standing = saved_hip_gains
+            pd.kp[stance_index] = kp_standing
+            pd.kd[stance_index] = kd_standing
 
     after = env.get_state()
     ref_com = np.asarray(reference["com"], dtype=float)
@@ -334,6 +427,75 @@ def control_step(
         "landed_ankle_capture_suppressed": float(
             solution.get("landed_ankle_capture_suppressed", 0.0)
         ),
+        **hip_trace,
+    }
+
+
+def _left_hip_roll_trace(
+    env: IndustrialHumanoidEnv,
+    index: int,
+    q_des_before: np.ndarray,
+    q_des: np.ndarray,
+    q_meas: np.ndarray,
+    qd_meas: np.ndarray,
+    position_error: np.ndarray,
+    tau_position: np.ndarray,
+    tau_velocity: np.ndarray,
+    tau_pd: np.ndarray,
+    tau_gravity: np.ndarray,
+    tau_nominal: np.ndarray,
+    tau_safe: np.ndarray,
+    first_ctrl: np.ndarray,
+    kp: float,
+    kd: float,
+) -> dict[str, float]:
+    """Left hip-roll command, PD terms, and the torque MuJoCo received.
+
+    ``q_des`` here is the vector immediately before the PD. ``first_ctrl`` is
+    the torque passed into the first physics substep, before ``ctrlrange``
+    clipping. ``left_hip_roll_ctrl`` is the actuator command after that clip
+    on the last substep.
+    """
+    import mujoco
+
+    actuator = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_hip_roll")
+    joint = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "left_hip_roll")
+    dof = int(env.model.jnt_dofadr[joint])
+    mass = np.zeros((env.model.nv, env.model.nv), dtype=float)
+    mujoco.mj_fullM(env.model, env.data, mass)
+    inertia = float(mass[dof, dof])
+    return {
+        "q_des_before_walking_override": float(q_des_before[index]),
+        "q_des_after_walking_override": float(q_des[index]),
+        "q_des_immediately_before_PD": float(q_des[index]),
+        "measured_q": float(q_meas[index]),
+        "measured_qvel": float(qd_meas[index]),
+        "position_error": float(position_error[index]),
+        "tau_position": float(tau_position[index]),
+        "tau_velocity": float(tau_velocity[index]),
+        "tau_PD": float(tau_pd[index]),
+        "qfrc_bias": float(tau_gravity[index]),
+        "tau_gravity": float(tau_gravity[index]),
+        "left_hip_roll_tau_unclipped": float(
+            tau_position[index] + tau_velocity[index] + tau_gravity[index]
+        ),
+        "left_hip_roll_cbf_intervention": float(tau_nominal[index] - tau_safe[index]),
+        "left_hip_roll_ctrl_command": float(first_ctrl[index]),
+        "left_hip_roll_ctrl": float(env.data.ctrl[actuator]),
+        "left_hip_roll_actuator_force": float(env.data.actuator_force[actuator]),
+        "left_hip_roll_kp": float(kp),
+        "left_hip_roll_kd": float(kd),
+        "left_hip_roll_gear": float(env.model.actuator_gear[actuator, 0]),
+        "left_hip_roll_ctrl_low": float(env.model.actuator_ctrlrange[actuator, 0]),
+        "left_hip_roll_ctrl_high": float(env.model.actuator_ctrlrange[actuator, 1]),
+        "left_hip_roll_force_low": float(env.model.actuator_forcerange[actuator, 0]),
+        "left_hip_roll_force_high": float(env.model.actuator_forcerange[actuator, 1]),
+        "left_hip_roll_damping": float(env.model.dof_damping[dof]),
+        "left_hip_roll_armature": float(env.model.dof_armature[dof]),
+        "left_hip_roll_stiffness": float(env.model.jnt_stiffness[joint]),
+        "left_hip_roll_limit_low": float(env.model.jnt_range[joint, 0]),
+        "left_hip_roll_limit_high": float(env.model.jnt_range[joint, 1]),
+        "left_hip_roll_inertia": inertia,
     }
 
 
@@ -486,11 +648,13 @@ def build_step_command(
 
 
 def _com_over_foot(env: IndustrialHumanoidEnv, side: str) -> bool:
-    """True when the centre of mass and its capture point are inside one sole.
+    """True when a swing may start on ``side``.
 
-    Position alone is not enough. A centre of mass that is inside the sole
-    but still moving outward leaves the sole as soon as the other foot lifts.
-    The capture point ``c + v/omega`` has to be inside as well.
+    The foot has to be down and carrying load, the body upright, and both
+    the centre of mass and the capture point inside that sole, with the
+    horizontal speed still bounded. The capture point does not have to sit
+    in the middle of the sole. After liftoff the step is allowed to carry
+    it toward the inner edge; this gate only stops an early uncontrolled lift.
     """
     sole = support_polygon(env, (side,))
     state = env.get_state()
@@ -498,19 +662,17 @@ def _com_over_foot(env: IndustrialHumanoidEnv, side: str) -> bool:
     vel = np.asarray(state["com_velocity"], dtype=float).reshape(3)
     omega = float(np.sqrt(9.81 / max(float(com[2]), 0.2)))
     capture = com[:2] + vel[:2] / omega
-    low = sole.min(axis=0) + 0.01
-    high = sole.max(axis=0) - 0.01
-    if np.any(high <= low):
-        low = sole.min(axis=0)
-        high = sole.max(axis=0)
+    low = sole.min(axis=0)
+    high = sole.max(axis=0)
 
     def _inside(point: np.ndarray) -> bool:
         return bool(np.all(point >= low) and np.all(point <= high))
 
-    # A few centimetres per second is still a fly-through: the sole can
-    # contain the capture point only because the foot has rolled with the body.
-    slow = abs(float(vel[1])) < 0.03 and abs(float(vel[0])) < 0.08
-    return _inside(com[:2]) and _inside(capture) and slow
+    slow = abs(float(vel[1])) < 0.05 and abs(float(vel[0])) < 0.08
+    roll, pitch, _yaw = _rpy(np.asarray(state["base_rotation"], dtype=float))
+    upright = abs(float(roll)) < 0.35 and abs(float(pitch)) < 0.35
+    loaded = _foot_in_contact(env, side) and _foot_normal_force(env, side) > 30.0
+    return _inside(com[:2]) and _inside(capture) and slow and upright and loaded
 
 
 def _empty_lateral_log() -> dict[str, float | str]:
@@ -530,6 +692,184 @@ def _empty_lateral_log() -> dict[str, float | str]:
         "hip_yaw_target": np.nan,
         "ankle_roll_target": np.nan,
     }
+
+
+_PREPARATION_STATES = (
+    WalkState.RIGHT_SWING,
+    WalkState.LEFT_SWING,
+    WalkState.TOUCHDOWN_PREP,
+    WalkState.TOUCHDOWN,
+)
+def _arm_phase_support(
+    cbf: CBFFilter,
+    env: IndustrialHumanoidEnv,
+    gait: WalkingStateMachine,
+    phase: WalkState,
+    swing_side: str | None,
+    stance: tuple[str, ...] | None,
+    polygon: np.ndarray,
+    capture_y: float,
+    both_in_contact: bool,
+) -> None:
+    """Point the CBF at the support box for this walking phase.
+
+    Standing, the weight shift and early swing keep the geometric sole.
+    Late swing moves only the inner face into the gap. After both feet are
+    down the box is their measured combined polygon. The capture reference
+    is the transition line once the fall has started.
+    """
+    duration = float(gait.config.step_duration)
+    progress = float(np.clip(gait.swing_elapsed / duration, 0.0, 1.0)) if duration > 0.0 else 0.0
+    phase_name = support_phase(phase.value, progress, late_start=0.30)
+    opening = fall_blend(progress, phase.value)
+    gait._fall_progress = progress
+    gait._fall_opening = opening
+    transitioning = (
+        swing_side in ("left", "right")
+        and phase in _PREPARATION_STATES + (WalkState.DOUBLE_SUPPORT_RECOVERY,)
+    )
+    edge = float("nan")
+    target_y = float("nan")
+    if not transitioning:
+        cbf.set_support_polygon(polygon)
+    else:
+        stance_foot = "left" if swing_side == "right" else "right"
+        if stance is not None and len(stance) == 1:
+            stance_foot = stance[0]
+        stance_corners = sole_corners(env, stance_foot)
+        edge = stance_inner_edge_y(stance_corners, swing_side)
+        confirmed = combined_support_active(phase.value, both_in_contact)
+        if confirmed:
+            cbf.set_support_polygon(polygon)
+        elif opening <= 1e-9:
+            cbf.set_support_polygon(stance_corners)
+        else:
+            box = fall_safe_box(stance_corners, swing_side, opening)
+            cbf.set_support_bounds(box[0], box[1])
+        if opening > 1e-9:
+            target_y = float(TRANSITION_Y)
+    low, high = cbf.support_bounds
+    if swing_side == "left":
+        inner_y = float(high[1])
+        outer_y = float(low[1])
+    elif swing_side == "right":
+        inner_y = float(low[1])
+        outer_y = float(high[1])
+    else:
+        inner_y = float(low[1])
+        outer_y = float(high[1])
+    gait._transition_capture_y = target_y
+    gait._support_log = {
+        "support_phase": phase_name,
+        "cbf_support_region_min_y": float(low[1]),
+        "cbf_support_region_max_y": float(high[1]),
+        "stance_inner_edge_y": float(edge),
+        "support_inner_edge_original": float(edge),
+        "support_inner_edge_active": inner_y,
+        "support_outer_edge": outer_y,
+        "support_toe_edge": float(high[0]),
+        "support_heel_edge": float(low[0]),
+    }
+
+
+def _support_accelerations(cbf: CBFFilter, row: dict) -> tuple[float, float]:
+    """Lateral CoM acceleration of the nominal torque and of the safe torque.
+
+    These are the accelerations the support barrier sees. The capture-point
+    controller does not produce them.
+    """
+    matrix = np.asarray(cbf.control_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] < 2 or matrix.shape[1] == 0:
+        return float("nan"), float("nan")
+    width = int(matrix.shape[1])
+    nominal = np.asarray(row.get("tau_nominal", np.zeros(width)), dtype=float).reshape(-1)
+    safe = np.asarray(row.get("tau_safe", np.zeros(width)), dtype=float).reshape(-1)
+    if nominal.size < width or safe.size < width:
+        return float("nan"), float("nan")
+    bias = np.asarray(getattr(cbf, "_a0", np.zeros(2)), dtype=float).reshape(-1)
+    nominal_accel = matrix @ nominal[:width]
+    safe_accel = matrix @ safe[:width]
+    if bias.size >= 2:
+        nominal_accel = nominal_accel + bias[: matrix.shape[0]]
+        safe_accel = safe_accel + bias[: matrix.shape[0]]
+    return float(nominal_accel[1]), float(safe_accel[1])
+
+
+def _capture_controller(gait: WalkingStateMachine) -> CapturePreparation:
+    controller = getattr(gait, "_capture_preparation", None)
+    if controller is None:
+        controller = CapturePreparation(max_forward_velocity=WALK_SPEED)
+        gait._capture_preparation = controller
+    return controller
+
+
+def _apply_capture_preparation(
+    gait: WalkingStateMachine,
+    env: IndustrialHumanoidEnv,
+    shift: LateralWeightShift,
+    reference: dict[str, np.ndarray],
+    state_now: dict[str, np.ndarray],
+    phase: WalkState,
+    swing_side: str | None,
+    dt: float,
+    capture_target: np.ndarray | None = None,
+) -> None:
+    """Replace the lateral CoM reference with the capture-point velocity.
+
+    The target is chosen by the support phase: the stance inner edge during
+    late swing, then the middle of the combined soles after contact. The
+    forward reference stays on the weight shift. This function does not
+    write a torque. The CBF remains the last filter on the way to MuJoCo.
+    """
+    preparing = (
+        capture_target is not None
+        and phase in _PREPARATION_STATES + (WalkState.DOUBLE_SUPPORT_RECOVERY,)
+    )
+    command = _capture_controller(gait).step(
+        state_now["com"],
+        state_now["com_velocity"],
+        None,
+        None,
+        1.0,
+        preparing,
+        dt,
+        capture_target=capture_target,
+    )
+    gait._capture_log = {
+        "capture_preparation_active": 1.0 if command.active else 0.0,
+        "capture_preparation_blend": float(command.blend),
+        "current_capture_x": float(command.current_capture[0]),
+        "current_capture_y": float(command.current_capture[1]),
+        "desired_capture_x": float(command.desired_capture[0]),
+        "desired_capture_y": float(command.desired_capture[1]),
+        "capture_error_x": float(command.capture_error[0]),
+        "capture_error_y": float(command.capture_error[1]),
+        "desired_com_vx": float(command.desired_com_velocity[0]),
+        "desired_com_vy": float(command.desired_com_velocity[1]),
+        "applied_com_vx": 0.0,
+        "applied_com_vy": 0.0,
+    }
+    if not _fall_holds_lean(gait, phase, swing_side):
+        shift.preparation_hold = bool(command.active)
+    if not command.active:
+        gait._applied_com_velocity = np.zeros(2)
+        return
+    measured = np.asarray(state_now["com"], dtype=float).reshape(3)
+    velocity = np.asarray(command.desired_com_velocity, dtype=float).reshape(2)
+    gait._applied_com_velocity = velocity.copy()
+    gait._capture_log["applied_com_vx"] = float(velocity[0])
+    gait._capture_log["applied_com_vy"] = float(velocity[1])
+    com_ref = np.asarray(reference["com"], dtype=float).copy()
+    if com_ref.ndim == 1:
+        com_ref = com_ref.reshape(1, 3)
+    for knot in range(com_ref.shape[0]):
+        com_ref[knot, 1] = float(measured[1]) + float(velocity[1]) * (knot + 1) * float(dt)
+    reference["com"] = com_ref
+    vel_ref = np.asarray(reference.get("com_velocity", np.zeros_like(com_ref)), dtype=float).copy()
+    if vel_ref.shape != com_ref.shape:
+        vel_ref = np.zeros_like(com_ref)
+    vel_ref[:, 1] = float(velocity[1])
+    reference["com_velocity"] = vel_ref
 
 
 def walk_tick(
@@ -597,7 +937,7 @@ def walk_tick(
                     desired,
                     env,
                     side=swing_side,
-                    max_lateral=float(gait.config.max_lateral_step_adjustment),
+                    max_lateral=float(gait.config.max_lateral_step_adjustment) + 0.02,
                 ).reachable
             )
     command = gait.update(
@@ -669,7 +1009,17 @@ def walk_tick(
     # None means every contact Jacobian the model reported. A named tuple is
     # the only set the MPC treats as planted.
     mpc_support_feet = "+".join(stance) if stance else "all"
-    cbf.set_support_polygon(polygon)
+    _arm_phase_support(
+        cbf,
+        env,
+        gait,
+        phase,
+        active,
+        stance,
+        polygon,
+        float(capture_pre[1]),
+        bool(contacts["left"] and contacts["right"]),
+    )
     pose: dict[str, float] = {}
     lateral_log = _empty_lateral_log()
     placed_side = str(getattr(gait, "_placed_hip_roll_side", ""))
@@ -690,15 +1040,32 @@ def walk_tick(
             sagittal_target = target.copy()
             if np.isfinite(original_y):
                 sagittal_target[1] = float(original_y)
-            sagittal = ik.solve(sagittal_target, env, side=side)
-            sagittal_ankle = ik.ankle_position(env, side, sagittal)
+            # The offset is measured from the hip roll the weight shift would
+            # command. The measured roll already contains an earlier lateral
+            # command, and adding the correction to that rolls the target again.
+            reference_roll = _shift_hip_roll(_weight_shift(gait, env.model), mpc, side)
+            if reference_roll is None:
+                sagittal = ik.solve(sagittal_target, env, side=side)
+                sagittal_ankle = ik.ankle_position(env, side, sagittal)
+            else:
+                sagittal, sagittal_ankle = ik.ankle_at_hip_roll(
+                    sagittal_target, env, side, reference_roll
+                )
             desired = sagittal_ankle.copy()
             desired[1] += lateral_correction
+            # The 4 cm clamp is already applied to ``lateral_correction``,
+            # measured from the weight-shift ankle. The pitch plane of the
+            # measured leg can sit a few millimetres away from that ankle.
+            # The solver's own gate has to cover that gap, or it rejects the
+            # clamped target and the foot never leaves the uncorrected path.
+            plane = ik.ankle_position(env, side, ik.solve(sagittal_target, env, side=side))
+            needed = abs(float(desired[1] - plane[1]))
+            limit = float(gait.config.max_lateral_step_adjustment)
             solved = ik.solve_lateral(
                 desired,
                 env,
                 side=side,
-                max_lateral=float(gait.config.max_lateral_step_adjustment),
+                max_lateral=max(limit, min(needed, limit + 0.02)),
             )
             pose[f"{side}_hip_pitch"] = sagittal.hip_pitch
             pose[f"{side}_knee"] = sagittal.knee
@@ -847,6 +1214,7 @@ def walk_tick(
         # Armed only while a foot is in the air. advance() still ignores it
         # until the capture point is inside 5 cm of the outer sole edge.
         shift.capture_trim = bool(late_swing_capture) and swing is not None and shift.mode != "prep"
+        shift.preparation_hold = _fall_holds_lean(gait, phase, active)
         ref_xy = shift.advance(
             mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
         )
@@ -868,6 +1236,7 @@ def walk_tick(
         shift.capture_trim = False
         if shift.mode == "recovery":
             shift.hold_landed = False
+            shift.preparation_hold = _fall_holds_lean(gait, phase, active)
             ref_xy = shift.advance(
                 mpc.config.dt, state_now["com"], state_now["com_velocity"], sole
             )
@@ -914,6 +1283,13 @@ def walk_tick(
         both = support_polygon(env, ("left", "right"))
         stance_sole = both
         stance_xy = both.mean(axis=0)
+    target_y = float(getattr(gait, "_transition_capture_y", np.nan))
+    capture_target = None
+    if np.isfinite(target_y):
+        capture_target = np.array([float(state_now["com"][0]), target_y], dtype=float)
+    _apply_capture_preparation(
+        gait, env, shift, reference, state_now, phase, active, mpc.config.dt, capture_target
+    )
     swing_pose = None
     if swing is not None and not freeze_swing:
         # Only the swinging leg leaves the shift posture. Replacing the
@@ -934,6 +1310,8 @@ def walk_tick(
             previous = float(held.get(name, measured.get(name, angle)))
             swing_pose[name] = previous + float(np.clip(float(angle) - previous, -ramp, ramp))
         gait._swing_command = dict(swing_pose)
+        if f"{swing}_hip_roll" in swing_pose:
+            gait._lateral_ik_log["swing_pose_hip_roll"] = float(swing_pose[f"{swing}_hip_roll"])
     else:
         gait._swing_command = {}
     # The touchdown policy, when one is loaded, may add a clipped centre-of-mass
@@ -963,6 +1341,9 @@ def walk_tick(
         landed_side = active
     shift.hold_touchdown_hip_roll = bool(gait.config.hold_touchdown_hip_roll)
     shift.placed_hip_roll_side = str(getattr(gait, "_placed_hip_roll_side", ""))
+    fall_hip = _fall_hip_command(
+        gait, shift, mpc, env, phase, active, capture_pre, float(mpc.config.dt)
+    )
     row = control_step(
         env,
         mpc,
@@ -977,6 +1358,7 @@ def walk_tick(
         posture=active_posture,
         landed_side=landed_side,
         landed_ankle_capture=bool(gait.config.landed_ankle_capture),
+        stance_hip_roll=fall_hip,
     )
     row["swing_side"] = swing or ""
     row["stance_foot_xy"] = np.asarray(stance_xy, dtype=float).reshape(2)
@@ -1030,7 +1412,12 @@ def walk_tick(
     row["loaded_foot"] = gait.loaded_foot or ""
     duration = float(gait.config.step_duration)
     if (
-        command.state in (WalkState.RIGHT_SWING, WalkState.LEFT_SWING, WalkState.TOUCHDOWN_PREP)
+        command.state in (
+            WalkState.RIGHT_SWING,
+            WalkState.LEFT_SWING,
+            WalkState.TOUCHDOWN_PREP,
+            WalkState.TOUCHDOWN,
+        )
         and duration > 0.0
     ):
         row["swing_progress"] = float(np.clip(gait.swing_elapsed / duration, 0.0, 1.0))
@@ -1038,9 +1425,43 @@ def walk_tick(
         row["swing_progress"] = 0.0
     for key, value in getattr(gait, "_lateral_ik_log", _empty_lateral_log()).items():
         row[key] = value
-    row["capture_point_y"] = float(capture_pre[1])
+    for key, value in getattr(gait, "_capture_log", {}).items():
+        row[key] = value
+    for key, value in getattr(gait, "_support_log", {}).items():
+        row[key] = value
+    for key, value in getattr(gait, "_fall_log", _empty_fall_log()).items():
+        row[key] = value
+    fall_side = str(getattr(gait, "_fall_side", ""))
+    if fall_side in ("left", "right"):
+        row["stance_hip_roll_measured"] = float(row[f"{fall_side}_hip_roll"])
+    else:
+        row["stance_hip_roll_measured"] = float("nan")
+    if active == "right":
+        inner_margin = float(row.get("support_y_lower", np.nan))
+    elif active == "left":
+        inner_margin = float(row.get("support_y_upper", np.nan))
+    else:
+        inner_margin = float(
+            min(row.get("support_y_lower", np.nan), row.get("support_y_upper", np.nan))
+        )
+    nominal_accel, safe_accel = _support_accelerations(cbf, row)
+    row["cbf_support_margin"] = inner_margin
+    row["cbf_nominal_capture_accel_y"] = float(nominal_accel)
+    row["cbf_safe_capture_accel_y"] = float(safe_accel)
+    row["cbf_nominal_acceleration_y"] = float(nominal_accel)
+    row["cbf_safe_acceleration_y"] = float(safe_accel)
+    row["cbf_intervention"] = float(row.get("intervention", 0.0))
+    row["right_normal_force"] = float(normal_force["right"])
+    row["left_normal_force"] = float(normal_force["left"])
+    row["capture_point_y"] = float(capture[1])
+    row["desired_capture_point_y"] = float(row.get("desired_capture_y", np.nan))
+    row["capture_point_target_y"] = float(row.get("capture_point_target_y", np.nan))
     row["com_y"] = float(row["com"][1])
+    row["com_velocity_y"] = float(row["com_velocity"][1])
+    row["com_acceleration_y"] = float(np.asarray(row["com_acceleration"], dtype=float).reshape(3)[1])
     row["com_vy"] = float(row["com_velocity"][1])
+    row["desired_com_y"] = float(np.asarray(row["com_reference"], dtype=float).reshape(3)[1])
+    row["desired_com_velocity_y"] = float(row.get("desired_com_vy", 0.0))
     row["stance_foot"] = str(command.support_foot)
     row["swing_foot"] = active or ""
     row["original_swing_target_y"] = float(gait.original_swing_target_y)
@@ -1048,6 +1469,35 @@ def walk_tick(
     row["adaptive_lateral_correction"] = float(gait.adaptive_lateral_correction)
     row["adaptive_requested_correction"] = float(gait.adaptive_requested_correction)
     row["adaptive_placement_fallback"] = float(gait.adaptive_placement_fallback)
+    row["requested_lateral_correction"] = float(gait.adaptive_requested_correction)
+    row["applied_lateral_correction"] = float(gait.adaptive_lateral_correction)
+    track_side = swing if swing in ("left", "right") else ""
+    if (
+        not track_side
+        and active in ("left", "right")
+        and command.state in (WalkState.RIGHT_SWING, WalkState.LEFT_SWING, WalkState.TOUCHDOWN_PREP)
+    ):
+        track_side = active
+    if track_side in ("left", "right"):
+        measured_y = float(row[f"{track_side}_foot_xyz"][1])
+        ik_y = float(row.get("desired_foot_y", np.nan))
+        row["ik_foot_y"] = ik_y
+        row["measured_foot_y"] = measured_y
+        row["lateral_tracking_error"] = float(ik_y - measured_y) if np.isfinite(ik_y) else np.nan
+        row["q_des_hip_roll"] = float(row[f"{track_side}_hip_roll_des"])
+        row["actual_hip_roll"] = float(row[f"{track_side}_hip_roll"])
+        row["q_des_hip_pitch"] = float(row[f"{track_side}_hip_pitch_des"])
+        row["q_des_knee"] = float(row[f"{track_side}_knee_des"])
+        row["q_des_ankle"] = float(row[f"{track_side}_ankle_des"])
+    else:
+        row["ik_foot_y"] = np.nan
+        row["measured_foot_y"] = np.nan
+        row["lateral_tracking_error"] = np.nan
+        row["q_des_hip_roll"] = np.nan
+        row["actual_hip_roll"] = np.nan
+        row["q_des_hip_pitch"] = np.nan
+        row["q_des_knee"] = np.nan
+        row["q_des_ankle"] = np.nan
     if command.support_foot == "left":
         row["stance_foot_y"] = float(row["left_foot_xyz"][1])
     elif command.support_foot == "right":
@@ -1357,6 +1807,135 @@ def _recovery_sample_ok(
     )
 
 
+def _empty_fall_log() -> dict[str, float]:
+    return {
+        "stance_hip_roll_base": float("nan"),
+        "stance_hip_roll_capture_target": float("nan"),
+        "stance_hip_roll_final_target": float("nan"),
+        "capture_point_target_y": float("nan"),
+        "double_support_capture_margin": float("nan"),
+        "release_capture_correction": 0.0,
+    }
+
+
+def _fall_holds_lean(gait: WalkingStateMachine, phase: WalkState, swing_side: str | None) -> bool:
+    """True while the weight-shift lean must stay latched for the fall."""
+    in_fall = (
+        swing_side in ("left", "right")
+        and phase in _PREPARATION_STATES + (WalkState.DOUBLE_SUPPORT_RECOVERY,)
+    )
+    release = getattr(gait, "_fall_release", None)
+    released = release is not None and release.started and release.blend >= 1.0
+    latched = str(getattr(gait, "_fall_base_side", "")) in ("left", "right")
+    return bool((in_fall or latched) and not released)
+
+
+def _fall_hip_command(
+    gait: WalkingStateMachine,
+    shift: LateralWeightShift,
+    mpc: WholeBodyMPC,
+    env: IndustrialHumanoidEnv,
+    phase: WalkState,
+    swing_side: str | None,
+    capture_xy: np.ndarray,
+    dt: float,
+) -> tuple[str, float] | None:
+    """Stance hip target for this tick, or None outside a step.
+
+    The value is written onto q_des after the shift and the swing IK, so it
+    is the last stance-hip command before the PD.
+    """
+    release = getattr(gait, "_fall_release", None)
+    if not isinstance(release, FallRelease):
+        release = FallRelease()
+        gait._fall_release = release
+    fall_side = "left" if swing_side == "right" else "right" if swing_side == "left" else ""
+    in_fall = fall_side in ("left", "right") and phase in _PREPARATION_STATES + (
+        WalkState.DOUBLE_SUPPORT_RECOVERY,
+    )
+    # Recovery can return to stand before the new foot is loaded. The inward
+    # target stays until the release conditions are met. Handing the hip back
+    # to the weight-shift blend at that moment puts the old lean on again.
+    latched = str(getattr(gait, "_fall_base_side", "")) in ("left", "right")
+    if not in_fall and not latched:
+        release.update(in_recovery=False, capture_margin=0.0, new_foot_force=0.0, dt=dt)
+        gait._fall_base_side = ""
+        gait._fall_side = ""
+        gait._fall_seen_recovery = False
+        gait._fall_log = _empty_fall_log()
+        return None
+    if not in_fall:
+        fall_side = str(gait._fall_base_side)
+    if getattr(gait, "_fall_base_side", "") != fall_side:
+        base = _shift_hip_roll(shift, mpc, fall_side)
+        if base is None:
+            gait._fall_log = _empty_fall_log()
+            return None
+        gait._fall_hip_base = float(base)
+        gait._fall_hip_home = float(
+            mpc._home_joint_qpos[list(mpc._joint_names).index(f"{fall_side}_hip_roll")]
+        )
+        gait._fall_base_side = fall_side
+        gait._fall_new_foot = "right" if fall_side == "left" else "left"
+    if phase is WalkState.DOUBLE_SUPPORT_RECOVERY:
+        gait._fall_seen_recovery = True
+    both = _foot_in_contact(env, "left") and _foot_in_contact(env, "right")
+    if both:
+        margin = capture_box_margin(capture_xy, support_polygon(env, ("left", "right")))
+    else:
+        margin = -1.0
+    new_foot = swing_side if swing_side in ("left", "right") else str(getattr(gait, "_fall_new_foot", ""))
+    force = _foot_normal_force(env, new_foot) if new_foot in ("left", "right") else 0.0
+    blend = release.update(
+        in_recovery=phase is WalkState.DOUBLE_SUPPORT_RECOVERY or bool(getattr(gait, "_fall_seen_recovery", False)),
+        capture_margin=margin,
+        new_foot_force=force,
+        dt=dt,
+    )
+    weight = float(getattr(gait, "_fall_opening", 0.0)) if in_fall else 1.0
+    angle = stance_hip_roll_capture_target(
+        float(gait._fall_hip_base),
+        float(capture_xy[1]),
+        TRANSITION_Y,
+        weight,
+        gain=float(mpc.config.capture_gain),
+        home=float(gait._fall_hip_home),
+        release=blend,
+    )
+    full = stance_hip_roll_capture_target(
+        float(gait._fall_hip_base),
+        float(capture_xy[1]),
+        TRANSITION_Y,
+        1.0,
+        gain=float(mpc.config.capture_gain),
+    )
+    gait._fall_log = {
+        "stance_hip_roll_base": float(gait._fall_hip_base),
+        "stance_hip_roll_capture_target": float(full),
+        "stance_hip_roll_final_target": float(angle),
+        "capture_point_target_y": float(TRANSITION_Y) if weight > 0.0 else float("nan"),
+        "double_support_capture_margin": float(margin) if both else float("nan"),
+        "release_capture_correction": float(blend),
+    }
+    gait._fall_side = fall_side
+    return fall_side, float(angle)
+
+
+def _shift_hip_roll(shift: LateralWeightShift, mpc: WholeBodyMPC, side: str) -> float | None:
+    """Hip roll the weight shift would command for ``side``, before lateral IK.
+
+    This is the blend ``apply`` writes during the shift and during swing.
+    ``None`` when that posture has not been solved yet.
+    """
+    name = f"{side}_hip_roll"
+    if not shift.solved or shift.fraction <= 0.0 or name not in shift.pose:
+        return None
+    index = list(mpc._joint_names).index(name)
+    home = float(mpc._home_joint_qpos[index])
+    fraction = float(shift.fraction)
+    return (1.0 - fraction) * home + fraction * float(shift.pose[name])
+
+
 def _weight_shift(gait: WalkingStateMachine, model) -> LateralWeightShift:
     """One shift solver per gait, created on the first tick."""
     shift = getattr(gait, "_lateral_shift", None)
@@ -1507,15 +2086,8 @@ def run_demo(args: argparse.Namespace) -> Path:
         # The shift is slower than the swing so the centre of mass is over
         # the stance sole before the other foot leaves the ground.
         adaptive_placement = bool(getattr(args, "adaptive_foot_placement", False))
-        # The load-transfer offsets stay available, but this experiment must
-        # not run them together with a new landing. The baseline command
-        # leaves the flag off, so those offsets stay at their existing values.
-        if adaptive_placement:
-            load_com_offset = 0.0
-            load_hip_roll = 0.0
-        else:
-            load_com_offset = float(getattr(args, "load_transfer_max_com_offset", 0.04))
-            load_hip_roll = float(getattr(args, "load_transfer_max_hip_roll", 0.08))
+        # Support transition owns the step into double support. The separate
+        # load-transfer offsets stay at zero for this walk.
         gait = WalkingStateMachine(
             WalkConfig(
                 step_length=float(getattr(args, "step_length", 0.1)),
@@ -1526,8 +2098,8 @@ def run_demo(args: argparse.Namespace) -> Path:
                 stand_duration=1.5,
                 hold_touchdown_hip_roll=bool(getattr(args, "hold_touchdown_hip_roll", False)),
                 load_transfer_duration=float(getattr(args, "load_transfer_duration", 0.40)),
-                load_transfer_max_com_offset=load_com_offset,
-                load_transfer_max_hip_roll=load_hip_roll,
+                load_transfer_max_com_offset=0.0,
+                load_transfer_max_hip_roll=0.0,
                 adaptive_foot_placement=adaptive_placement,
                 capture_footstep_gain=float(getattr(args, "capture_footstep_gain", 0.5)),
                 max_lateral_step_adjustment=float(getattr(args, "max_lateral_step_adjustment", 0.04)),

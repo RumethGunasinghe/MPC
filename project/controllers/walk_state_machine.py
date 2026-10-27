@@ -152,7 +152,7 @@ class WalkConfig:
             force the new foot must carry in the final quarter of the schedule.
         load_transfer_success_dwell: Seconds that share must hold, continuously,
             before the load-transfer check latches.
-        adaptive_foot_placement: When true, late swing may move the existing
+        adaptive_foot_placement: When true, the swing may move the existing
             lateral landing target toward the capture point. The forward step
             length is unchanged. Default false leaves the landing where
             :func:`_landing` put it.
@@ -166,6 +166,8 @@ class WalkConfig:
         adaptive_placement_start: Swing progress at which the lateral
             correction begins to ramp in. Earlier progress leaves the
             original target unchanged.
+        adaptive_placement_end: Swing progress at which the ramp reaches the
+            full requested correction. Later progress holds that value.
     """
 
     step_length: float = 0.1
@@ -197,7 +199,8 @@ class WalkConfig:
     adaptive_foot_placement: bool = False
     capture_footstep_gain: float = 0.5
     max_lateral_step_adjustment: float = 0.04
-    adaptive_placement_start: float = 0.65
+    adaptive_placement_start: float = 0.10
+    adaptive_placement_end: float = 0.50
 
     def __post_init__(self) -> None:
         self.forward = np.asarray(self.forward, dtype=float).reshape(3)
@@ -248,6 +251,8 @@ class WalkConfig:
             raise ValueError("max_lateral_step_adjustment must be non-negative")
         if not 0.0 <= float(self.adaptive_placement_start) < 1.0:
             raise ValueError("adaptive_placement_start must be in [0, 1)")
+        if not float(self.adaptive_placement_start) < float(self.adaptive_placement_end) <= 1.0:
+            raise ValueError("adaptive_placement_end must be in (start, 1]")
 
 
 @dataclass(frozen=True)
@@ -414,6 +419,18 @@ class WalkingStateMachine:
         return float(self._swing_target[1])
 
     @property
+    def planned_landing(self) -> np.ndarray | None:
+        """Ankle position the swing is landing on, including a lateral correction.
+
+        This is the end of the swing trajectory, not the airborne sample.
+        ``None`` when no swing landing is armed.
+        """
+        target = getattr(self, "_swing_target", None)
+        if target is None:
+            return None
+        return np.asarray(target, dtype=float).reshape(3).copy()
+
+    @property
     def adaptive_lateral_correction(self) -> float:
         """Lateral correction added to the original landing, in metres."""
         return float(getattr(self, "_adaptive_correction", 0.0))
@@ -450,8 +467,8 @@ class WalkingStateMachine:
     def placement_check_due(self, dt: float) -> bool:
         """True on the tick that must test the full lateral landing for reachability.
 
-        The check happens once, at the start of the late-swing window, so a
-        rejected target never enters the trajectory and then jumps back.
+        The check happens once, as the airborne ramp opens, so a rejected
+        target never enters the trajectory and then jumps back.
         """
         if not bool(self.config.adaptive_foot_placement):
             return False
@@ -588,10 +605,12 @@ class WalkingStateMachine:
         stance_foot_y: float | None,
         stance_inner_y: float | None,
     ) -> None:
-        """Ramp the existing landing's lateral coordinate during late swing.
+        """Ramp the existing landing's lateral coordinate during the airborne swing.
 
-        The forward coordinate stays on the footstep target. An unreachable
-        full correction latches the original landing for the rest of this swing.
+        The forward coordinate stays on the footstep target. The ramp finishes
+        at ``adaptive_placement_end`` and the full correction is then held.
+        An unreachable full correction latches the original landing for the
+        rest of this swing.
         """
         if self._original_swing_target is None or self._swing_target is None:
             self._adaptive_correction = 0.0
@@ -614,6 +633,7 @@ class WalkingStateMachine:
         duration = float(self.config.step_duration)
         progress = 0.0 if duration <= 0.0 else float(np.clip(self._swing_elapsed / duration, 0.0, 1.0))
         start = float(self.config.adaptive_placement_start)
+        finish = float(self.config.adaptive_placement_end)
         if self._placement_rejected:
             self._swing_target = self._original_swing_target.copy()
             self._adaptive_correction = 0.0
@@ -632,7 +652,7 @@ class WalkingStateMachine:
                 self._adaptive_correction = 0.0
                 return
             self._placement_accepted = True
-        applied = placement_ramp(progress, start) * float(requested)
+        applied = placement_ramp(progress, start, finish) * float(requested)
         target = self._original_swing_target.copy()
         target[1] = float(self._original_swing_target[1]) + applied
         self._swing_target = target

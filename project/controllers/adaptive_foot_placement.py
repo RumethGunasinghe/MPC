@@ -1,4 +1,4 @@
-"""Late-swing lateral landing adjustment from the capture point.
+"""Early-swing lateral landing adjustment from the capture point.
 
 The footstep planner still chooses the forward landing. This module only
 moves that landing's lateral coordinate, and only by a bounded amount, so
@@ -23,16 +23,22 @@ SOLE_TOE = 0.140
 SOLE_HALF_WIDTH = 0.020
 
 
-def placement_ramp(progress: float, start: float = 0.65) -> float:
-    """Smoothstep from 0 at ``start`` to 1 at the end of the swing.
+def placement_ramp(progress: float, start: float = 0.10, end: float = 0.50) -> float:
+    """Smoothstep from 0 at ``start`` to 1 at ``end``.
 
-    Before ``start`` the value is 0, so the landing target does not move
-    during the lift or the early forward travel.
+    Before ``start`` the correction is zero. After ``end`` it stays at the
+    full requested value through the rest of the swing, so the ankle has
+    the airborne part of the step in which to arrive.
     """
     begin = float(start)
-    if float(progress) <= begin or begin >= 1.0:
+    finish = float(end)
+    if float(progress) <= begin:
         return 0.0
-    span = 1.0 - begin
+    if finish <= begin:
+        return 1.0
+    if float(progress) >= finish:
+        return 1.0
+    span = finish - begin
     s = float(np.clip((float(progress) - begin) / span, 0.0, 1.0))
     return (3.0 * s * s) - (2.0 * s * s * s)
 

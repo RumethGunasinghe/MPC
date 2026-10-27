@@ -259,6 +259,29 @@ class LegIK:
             return self._with_roll(sagittal, current_roll, current_yaw, "residual", 0.0, False)
         return self._with_roll(pitched, roll, current_yaw, "", lateral, True)
 
+    def ankle_at_hip_roll(
+        self,
+        foot_target: np.ndarray,
+        state,
+        side: str,
+        hip_roll: float,
+    ) -> tuple[LegJoints, np.ndarray]:
+        """Existing pitch solution and its ankle position at one hip roll.
+
+        ``hip_roll`` is the roll the sagittal swing would use. The measured
+        roll is not used, so a lateral offset is not added on top of itself.
+        """
+        if side not in self._legs:
+            raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+        data = _as_mjdata(state)
+        leg = self._legs[side]
+        target = np.asarray(foot_target, dtype=float).reshape(3)
+        joints = self._solve_at_roll(data, leg, target, float(hip_roll), side)
+        position = self._ankle_at(
+            data, leg, float(hip_roll), joints.hip_pitch, joints.knee, joints.ankle_pitch
+        )
+        return joints, position
+
     def ankle_position(self, state, side: str, joints: LegJoints, hip_roll: float | None = None) -> np.ndarray:
         """World ankle position for ``joints`` at the given or measured hip roll.
 
