@@ -85,6 +85,7 @@ from controllers.load_transfer import (
 from controllers.leg_ik import LegIK, LegJoints
 from controllers.mpc_controller import MPCConfig, WholeBodyMPC
 from controllers.pd_controller import PDController
+from controllers.steady_walk import SteadyWalk, steady_tick
 from controllers.walk_state_machine import (
     WalkConfig,
     WalkingStateMachine,
@@ -3053,6 +3054,7 @@ def run_demo(args: argparse.Namespace) -> Path:
     height = float(state0["com"][2])
     gait: WalkingStateMachine | None = None
     ik: LegIK | None = None
+    walker: SteadyWalk | None = None
     if args.walk:
         # The shift is slower than the swing so the centre of mass is over
         # the stance sole before the other foot leaves the ground.
@@ -3080,6 +3082,14 @@ def run_demo(args: argparse.Namespace) -> Path:
             )
         )
         ik = LegIK(env.model)
+        walker = SteadyWalk(
+            list(env.joint_names),
+            np.asarray(state0["joint_qpos"], dtype=float),
+            np.asarray(env.joint_limits[:, 0], dtype=float),
+            np.asarray(env.joint_limits[:, 1], dtype=float),
+            n_steps=int(args.steps),
+            first_swing="right",
+        )
         left_ankle, _left_rot = _ankle_pose(env, "left")
         right_ankle, _right_rot = _ankle_pose(env, "right")
         gait.start(
@@ -3128,22 +3138,8 @@ def run_demo(args: argparse.Namespace) -> Path:
     def one_tick(sim_time: float) -> dict:
         nonlocal pushed
         if args.walk:
-            assert gait is not None and ik is not None
-            return walk_tick(
-                env,
-                mpc,
-                cbf,
-                pd,
-                gait,
-                ik,
-                torso,
-                rows,
-                swing_ramp=0.03,
-                freeze_swing=bool(getattr(args, "freeze_swing", False)),
-                late_swing_capture=bool(getattr(args, "late_swing_capture", False)),
-                landing_handoff=bool(getattr(args, "landing_handoff", False)),
-                touchdown_agent=touchdown_agent,
-            )
+            assert walker is not None and ik is not None
+            return steady_tick(env, pd, cbf, walker, ik)
         reference = fixed_reference
         if not pushed and sim_time >= PUSH_TIME:
             body = apply_push(env, np.asarray(args.push_force, dtype=float))
@@ -3163,10 +3159,26 @@ def run_demo(args: argparse.Namespace) -> Path:
 
     if bool(getattr(args, "headless", False)):
         duration = float(getattr(args, "duration", 24.0))
+        next_report = 1.0
         try:
             while float(env.data.time) < duration:
                 row = one_tick(float(env.data.time))
                 rows.append(row)
+                if row["time"] >= next_report:
+                    com = row["com"]
+                    LOG.info(
+                        "t = %5.2f s | %s support %s | COM [%.3f %.3f %.3f] | vy %.3f | pitch %.3f | step %.0f",
+                        row["time"],
+                        row["walk_state"],
+                        row["support_foot"],
+                        com[0],
+                        com[1],
+                        com[2],
+                        float(row["com_velocity"][1]),
+                        float(row.get("pelvis_pitch", 0.0)),
+                        float(row.get("step_number", 0.0)),
+                    )
+                    next_report += 1.0
                 if float(row["com"][2]) < 0.72:
                     LOG.info("stopped: pelvis height %.3f m", float(row["com"][2]))
                     break
