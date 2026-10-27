@@ -1,5 +1,5 @@
 {
-  "log": "C:\\Users\\rumet\\Desktop\\MPC new\\project\\data\\logs\\standing_push_latest.npz",
+  "log": "data\\logs\\standing_push_latest.npz",
   "push_force_n": [
     80.0,
     0.0,

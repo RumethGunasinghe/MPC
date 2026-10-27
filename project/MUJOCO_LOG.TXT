@@ -1,0 +1,4 @@
+ERROR mj_setKeyframe (engine_support.c:362) Wed Oct 14 19:52:13 2026: keyframe index cannot be negative
+
+ERROR mj_setKeyframe (engine_support.c:362) Wed Oct 14 19:52:32 2026: keyframe index cannot be negative
+

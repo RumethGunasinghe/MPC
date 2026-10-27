@@ -353,6 +353,9 @@ class WholeBodyMPC:
         self,
         state: dict[str, np.ndarray],
         reference: dict[str, np.ndarray] | None = None,
+        *,
+        landed_side: str = "",
+        landed_ankle_capture: bool = True,
     ) -> dict[str, np.ndarray]:
         """Solve one MPC iteration.
 
@@ -386,7 +389,13 @@ class WholeBodyMPC:
 
         # Receding horizon: apply only the first control of each sequence.
         u0 = control[0]
-        q_des, qd_des, ik_info = self._joint_targets(state, task, u0)
+        q_des, qd_des, ik_info = self._joint_targets(
+            state,
+            task,
+            u0,
+            landed_side=landed_side,
+            landed_ankle_capture=landed_ankle_capture,
+        )
 
         self._last_solution = control
         return {
@@ -400,6 +409,10 @@ class WholeBodyMPC:
             "com_reference": task["position_reference"][:, _COM],
             "orientation_error": task["position"][_ORI],
             "solve_info": {**info, **ik_info},
+            "sagittal_capture_offset": float(ik_info.get("sagittal_capture_offset", 0.0)),
+            "landed_ankle_capture_suppressed": float(
+                ik_info.get("landed_ankle_capture_suppressed", 0.0)
+            ),
         }
 
     def _task_state(
@@ -530,6 +543,9 @@ class WholeBodyMPC:
         state: dict[str, np.ndarray],
         task: dict[str, np.ndarray],
         u0: np.ndarray,
+        *,
+        landed_side: str = "",
+        landed_ankle_capture: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         """Map the optimal task acceleration onto joint position targets.
 
@@ -541,7 +557,11 @@ class WholeBodyMPC:
         cfg = self.config
         dt = cfg.dt
         if not self.num_joints:
-            return np.zeros(0), np.zeros(0), {"ik_solver": "none"}
+            return np.zeros(0), np.zeros(0), {
+                "ik_solver": "none",
+                "sagittal_capture_offset": 0.0,
+                "landed_ankle_capture_suppressed": 0.0,
+            }
 
         jacobian = self._task_jacobian(state)  # 6 x nu, actuated columns only
 
@@ -628,8 +648,24 @@ class WholeBodyMPC:
         # that has already bent under gravity must stay an error, otherwise the
         # PD has nothing to correct. ``qd * dt`` is the one-tick task motion;
         # the capture offset is what keeps the floating base from toppling.
-        q_des = self._home_joint_qpos + qd * dt + self._capture_offset(state, task)
+        # The swing foot's landing ankle is excluded: adding the sagittal
+        # term there pitches a sole that was just levelled and lifts the foot.
+        # Hip roll still receives the lateral term.
+        capture = self._capture_offset(state, task)
+        sagittal = _sagittal_capture_offset(capture, self._joint_names)
+        applied = suppress_landed_ankle_capture(
+            capture,
+            self._joint_names,
+            landed_side,
+            allow_capture=landed_ankle_capture,
+        )
+        suppressed = float(
+            landed_side in ("left", "right") and not bool(landed_ankle_capture)
+        )
+        q_des = self._home_joint_qpos + qd * dt + applied
         q_des = np.clip(q_des, self._joint_low, self._joint_high)
+        ik_info["sagittal_capture_offset"] = sagittal
+        ik_info["landed_ankle_capture_suppressed"] = suppressed
         return q_des, np.zeros(self.num_joints), ik_info
 
     def _capture_offset(self, state: dict[str, np.ndarray], task: dict[str, np.ndarray]) -> np.ndarray:
@@ -692,6 +728,37 @@ class WholeBodyMPC:
 # ----------------------------------------------------------------------
 # Small maths helpers
 # ----------------------------------------------------------------------
+def suppress_landed_ankle_capture(
+    offset: np.ndarray,
+    joint_names: list[str],
+    landed_side: str = "",
+    *,
+    allow_capture: bool = True,
+) -> np.ndarray:
+    """Drop the sagittal capture term on the foot that just landed.
+
+    ``offset`` is the clipped capture vector from :meth:`WholeBodyMPC._capture_offset`.
+    The stance ankle and both hip rolls are left unchanged. ``allow_capture``
+    restores the previous behaviour of adding the term to the landed ankle.
+    """
+    applied = np.asarray(offset, dtype=float).copy()
+    if allow_capture or landed_side not in ("left", "right"):
+        return applied
+    ankle = f"{landed_side}_ankle"
+    for index, name in enumerate(joint_names):
+        if name == ankle or str(name).startswith(ankle):
+            applied[index] = 0.0
+    return applied
+
+
+def _sagittal_capture_offset(offset: np.ndarray, joint_names: list[str]) -> float:
+    """Clipped sagittal capture term, read from the first ankle entry."""
+    for index, name in enumerate(joint_names):
+        if "ankle" in name:
+            return float(np.asarray(offset, dtype=float).reshape(-1)[index])
+    return 0.0
+
+
 def _within(values: np.ndarray, low: np.ndarray, high: np.ndarray, tol: float = 1e-9) -> bool:
     """True when ``values`` satisfies the box ``[low, high]`` to within ``tol``."""
     return bool(np.all(values >= low - tol) and np.all(values <= high + tol))

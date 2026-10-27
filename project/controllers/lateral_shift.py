@@ -69,6 +69,26 @@ class LateralWeightShift:
         # off the sole after the swing.
         self.handoff_xy: np.ndarray | None = None
         self.hold_landed = False
+        # "shift" latches hip roll. "prep" eases the lateral reference inside
+        # the 8 mm band. "recovery" leaves hip roll to the MPC capture offset
+        # and slews the reference toward recovery_target.
+        self.mode = "shift"
+        self.reference_speed = 0.15
+        self.recovery_target = np.zeros(2)
+        self._held_xy: np.ndarray | None = None
+        # Debug hold. Recovery normally adds the lateral capture term on top
+        # of the shift blend. While this is set, hip roll stays on the blend.
+        self.hold_touchdown_hip_roll = False
+        # Swing leg whose hip roll was placed by the lateral IK. While this
+        # matches skip_side, that hip stays on the landed command instead of
+        # the shift blend. Empty leaves every hip roll on the existing law.
+        self.placed_hip_roll_side = ""
+        self.hip_roll_capture: dict[str, float] = {}
+        self.hip_roll_capture_available: dict[str, float] = {}
+        # Added after the base hip-roll target. Zero outside load transfer.
+        # Clipped again in ``_assign_hip_roll`` to this limit.
+        self.load_transfer_hip_roll = 0.0
+        self.load_transfer_hip_roll_limit = 0.08
 
     def begin(
         self,
@@ -95,6 +115,8 @@ class LateralWeightShift:
         self.handoff_xy = None
         self.hold_landed = False
         self._on_sole = False
+        self.mode = "shift"
+        self._held_xy = None
         self.origin_xy = np.asarray(com[:2], dtype=float).copy()
         self.target_xy = corners.mean(axis=0)
         self.sole_low = corners.min(axis=0)
@@ -212,7 +234,57 @@ class LateralWeightShift:
         # toward the sole centre walks the body onto the toes.
         reference[0] = float(np.clip(self.origin_xy[0], float(com[0]) - 0.008, float(com[0]) + 0.008))
         self._com = com.copy()
+        if self.mode == "prep":
+            return self._prep_reference(reference, com, toward, sign, dt)
+        if self.mode == "recovery":
+            return self._recovery_reference(reference, dt)
+        self._held_xy = np.asarray(reference, dtype=float).reshape(2).copy()
         return reference
+
+    def _prep_reference(
+        self,
+        reference: np.ndarray,
+        com: np.ndarray,
+        toward: float,
+        sign: float,
+        dt: float,
+    ) -> np.ndarray:
+        """Move the reference to the inner side of the 8 mm band, without a jump.
+
+        Hip roll stays on the latched blend during prep, so the reference has
+        to remain inside the band the MPC can track without that joint.
+        """
+        goal = np.asarray(reference, dtype=float).reshape(2).copy()
+        if toward > 0.0:
+            goal[1] = float(com[1]) - 0.008 * float(sign)
+        if self._held_xy is None:
+            self._held_xy = np.asarray(reference, dtype=float).reshape(2).copy()
+        self._held_xy = _slew(self._held_xy, goal, self.reference_speed, dt)
+        self._held_xy[0] = float(np.clip(self._held_xy[0], float(com[0]) - 0.008, float(com[0]) + 0.008))
+        self._held_xy[1] = float(np.clip(self._held_xy[1], float(com[1]) - 0.008, float(com[1]) + 0.008))
+        self.limit = "touchdown_prep"
+        return self._held_xy.copy()
+
+    def _recovery_reference(self, reference: np.ndarray, dt: float) -> np.ndarray:
+        """Slew toward the support interior. Do not clip onto the measured body."""
+        if self._held_xy is None:
+            self._held_xy = np.asarray(reference, dtype=float).reshape(2).copy()
+        self._held_xy = _slew(self._held_xy, self.recovery_target, self.reference_speed, dt)
+        self.limit = "recovery"
+        return self._held_xy.copy()
+
+    def _hip_roll_command(self, blended: float, commanded: float, home: float) -> float:
+        """Blend during the shift. Blend plus the MPC capture term in recovery.
+
+        ``hold_touchdown_hip_roll`` keeps the pre-touchdown blend through
+        recovery. The capture term is still computed by the MPC; it is just
+        not written onto the hip-roll target. The load-transfer offset is
+        not applied here. ``_assign_hip_roll`` adds it afterwards, whether
+        or not this hold is set.
+        """
+        if self.mode != "recovery" or self.hold_touchdown_hip_roll:
+            return float(blended)
+        return float(blended) + float(commanded) - float(home)
 
     def apply(
         self,
@@ -224,9 +296,10 @@ class LateralWeightShift:
     ) -> np.ndarray:
         """Leg targets for the current blend, with the MPC's sagittal residual kept.
 
-        Hip roll follows the solved posture alone. The capture offset on that
-        joint is the ±0.15 rad clip that stalled the old shift, and adding it
-        also breaks the pelvis-roll pair that keeps the soles flat. Hip pitch
+        Hip roll follows the solved posture alone during the shift. The capture
+        offset on that joint is the ±0.15 rad clip that stalled the old shift,
+        so the shift does not add it. During recovery the same offset is added
+        on top of the blend, and the blend no longer replaces it. Hip pitch
         and knee keep a small piece of the MPC command so the ankles can still
         balance fore-aft. Ankle pitch then levels the sole, plus that residual.
         """
@@ -235,25 +308,41 @@ class LateralWeightShift:
         q_des = np.asarray(q_mpc, dtype=float).copy()
         home = np.asarray(home, dtype=float)
         index = {name: i for i, name in enumerate(joint_names)}
+        self.hip_roll_capture = {}
+        self.hip_roll_capture_available = {}
         fraction = float(self.fraction)
         skip = self.skip_side
         for name, goal in self.pose.items():
             i = index.get(name)
             if i is None:
                 continue
+            # The lateral IK wrote this hip roll into the landed posture.
+            # Replacing it with the shift blend would move the foot back on
+            # the touchdown tick. The stance hip is not this joint.
+            if (
+                "hip_roll" in name
+                and self.placed_hip_roll_side
+                and self.skip_side == self.placed_hip_roll_side
+                and name.startswith(f"{self.placed_hip_roll_side}_")
+            ):
+                available = float(q_des[i]) - float(home[i])
+                q_des[i] = float(home[i])
+                self.hip_roll_capture_available[name] = available
+                self.hip_roll_capture[name] = 0.0
+                continue
             blended = (1.0 - fraction) * float(home[i]) + fraction * float(goal)
             if skip and name.startswith(f"{skip}_"):
-                # Hip roll stays on the lean. Pitch and knee stay on the
-                # touchdown command written into home: q_mpc would add the
-                # capture offset on the landing tick, about 0.13 rad on the
-                # ankle in the baseline hand-off.
+                # Pitch and knee stay on the touchdown command written into
+                # home: q_mpc would add the capture offset on the landing tick,
+                # about 0.13 rad on the ankle in the baseline hand-off.
+                # Hip roll still takes the recovery capture correction.
                 if "hip_roll" in name:
-                    q_des[i] = blended
+                    q_des[i] = self._assign_hip_roll(q_des, i, name, blended, float(home[i]))
                 elif self.hold_landed:
                     q_des[i] = float(home[i])
                 continue
             if "hip_roll" in name:
-                q_des[i] = blended
+                q_des[i] = self._assign_hip_roll(q_des, i, name, blended, float(home[i]))
             else:
                 residual = float(np.clip(q_des[i] - home[i], -0.10, 0.10))
                 q_des[i] = blended + residual
@@ -279,6 +368,35 @@ class LateralWeightShift:
             heel = float(np.clip(-4.0 * back, -0.2, 0.05))
             q_des[ankle] = -(q_des[hip] + q_des[knee]) + residual + heel
         return np.clip(q_des, low, high)
+
+    def _assign_hip_roll(
+        self,
+        q_des: np.ndarray,
+        index: int,
+        name: str,
+        blended: float,
+        home: float,
+    ) -> float:
+        """Write one hip roll and record the capture term that was applied."""
+        available = float(q_des[index]) - float(home)
+        command = self._hip_roll_command(blended, float(q_des[index]), home)
+        self.hip_roll_capture_available[name] = available
+        self.hip_roll_capture[name] = float(command) - float(blended)
+        limit = abs(float(self.load_transfer_hip_roll_limit))
+        correction = float(np.clip(self.load_transfer_hip_roll, -limit, limit))
+        return command + correction
+
+
+def _slew(current: np.ndarray, target: np.ndarray, speed: float, dt: float) -> np.ndarray:
+    """Move ``current`` toward ``target`` by at most ``speed * dt`` metres."""
+    current = np.asarray(current, dtype=float).reshape(2).copy()
+    target = np.asarray(target, dtype=float).reshape(2)
+    delta = target - current
+    distance = float(np.linalg.norm(delta))
+    step = max(0.0, float(speed)) * max(0.0, float(dt))
+    if distance <= step or distance <= 1e-9:
+        return target.copy()
+    return current + delta / distance * step
 
 
 def support_distance(com_xy: np.ndarray, sole_corners: np.ndarray) -> float:
